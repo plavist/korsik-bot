@@ -32,8 +32,9 @@ def parse_max_update(update: dict) -> dict | None:
         user = cb.get("user") or {}
         if not cb.get("payload") or user.get("user_id") is None or user.get("is_bot"):
             return None
+        mid = ((update.get("message") or {}).get("body") or {}).get("mid")   # сообщение, под которым нажата кнопка
         return {"kind": "callback", "user_id": str(user["user_id"]), "name": _display_name(user), "text": None,
-                "payload": str(cb["payload"]), "callback_id": cb.get("callback_id")}
+                "payload": str(cb["payload"]), "callback_id": cb.get("callback_id"), "message_id": mid}
     if kind != "message_created":
         return None
     msg = update.get("message") or {}
@@ -129,6 +130,22 @@ async def send_max(user_id: str, text: str, buttons: list | None = None, md: boo
             if body["attachments"] is None:
                 del body["attachments"]
             await _post_message(user_id, body)
+
+
+async def delete_pressed_message(message_id: str | None) -> bool:
+    """Убирает сообщение, под которым нажата кнопка (чат не засоряется отработавшими вопросами). True — сообщение удалено.
+    Не удалось удалить или удаление отключено (MAX_DELETE_PRESSED=0) — хотя бы снимаем кнопки, чтобы на них нельзя было нажать повторно."""
+    if not message_id:
+        return False
+    try:
+        if config.delete_pressed():
+            r = await max_request("DELETE", "/messages", params={"message_id": message_id}, timeout=15)
+            if r.status_code < 300:
+                return True
+        await max_request("PUT", "/messages", params={"message_id": message_id}, json={"attachments": []}, timeout=15)
+    except Exception:  # noqa: BLE001 — сбой не критичен: ответ пользователю уже отправлен
+        pass
+    return False
 
 
 async def answer_callback(callback_id: str) -> None:

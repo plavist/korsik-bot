@@ -6,7 +6,6 @@ data/
 .pytest_cache/
 .coverage
 
-# локальное окружение этой машины (прокси/host-сеть)
 compose.proxy.yml
 
 # секреты и ключи
@@ -16,7 +15,6 @@ compose.proxy.yml
 *.pem.key
 id_*
 
-# исходные материалы кейса и картинки (в образ не входят: загружаются через админку или API)
 ПОЛИПЛАСТИК/
 Korsiki_kartinki/
 

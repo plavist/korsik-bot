@@ -119,7 +119,7 @@ async def test_process_max_callback_text_and_start(monkeypatch):
     assert db.get_employee(emp["id"])["user_id"] == "900" and db.get_user("900")["name"] == "Мария Л"
     cb = channels.parse_max_update({"update_type": "message_callback", "callback": {
         "callback_id": "cb1", "payload": "a:welcome:2:vy", "user": {"user_id": 900, "name": "Мария Л"}}})
-    assert cb == {"kind": "callback", "user_id": "900", "name": "Мария Л", "text": None, "payload": "a:welcome:2:vy", "callback_id": "cb1"}
+    assert cb == {"kind": "callback", "user_id": "900", "name": "Мария Л", "text": None, "payload": "a:welcome:2:vy", "callback_id": "cb1", "message_id": None}
     await process_max(cb)
     assert ans.calls[0].request.url.params["callback_id"] == "cb1"
     assert db.get_employee(emp["id"])["form"] == "vy"
@@ -236,3 +236,42 @@ def test_simulated_time_tick_and_age_pending():
     assert isinstance(client.post("/api/scheduler/tick", json={}).json()["sent"], int)                     # реальное время
     assert anon.post("/api/scheduler/tick", json={}).status_code == 401
     assert client.post("/api/employees/999/age-pending", json={}).status_code == 404
+
+
+# ---------- удаление сообщения, под которым нажата кнопка ----------
+CB = {"update_type": "message_callback", "callback": {"callback_id": "cb1", "payload": "a:x:1:A", "user": {"user_id": 7, "name": "Ира"}},
+      "message": {"body": {"mid": "mid.123", "text": "Вопрос"}}}
+
+
+def test_callback_carries_message_id():
+    assert channels.parse_max_update(CB)["message_id"] == "mid.123"
+    assert channels.parse_max_update({**CB, "message": None})["message_id"] is None
+
+
+@respx.mock
+async def test_pressed_message_is_deleted_after_answer(monkeypatch):
+    llm_router()
+    monkeypatch.setenv("MAX_BOT_TOKEN", "tok")
+    respx.post("http://max/messages").mock(return_value=httpx.Response(200, json={}))
+    respx.post("http://max/answers").mock(return_value=httpx.Response(200, json={}))
+    delete = respx.delete("http://max/messages").mock(return_value=httpx.Response(200, json={"success": True}))
+    await process_max(channels.parse_max_update(CB))
+    assert delete.call_count == 1 and delete.calls[0].request.url.params["message_id"] == "mid.123"
+
+
+@respx.mock
+async def test_delete_falls_back_to_removing_keyboard_and_never_raises(monkeypatch):
+    monkeypatch.setenv("MAX_BOT_TOKEN", "tok")
+    respx.delete("http://max/messages").mock(return_value=httpx.Response(403, json={"code": "forbidden"}))
+    edit = respx.put("http://max/messages").mock(return_value=httpx.Response(200, json={}))
+    assert await channels.delete_pressed_message("mid.1") is False
+    assert json.loads(edit.calls[0].request.content) == {"attachments": []}            # кнопки сняты, чтобы не нажимали повторно
+    respx.delete("http://max/messages").mock(side_effect=httpx.ConnectError("down"))
+    assert await channels.delete_pressed_message("mid.1") is False                        # сбой сети не ломает обработку
+    respx.delete("http://max/messages").mock(return_value=httpx.Response(200, json={}))
+    assert await channels.delete_pressed_message("mid.1") is True
+    assert await channels.delete_pressed_message(None) is False
+    monkeypatch.setenv("MAX_DELETE_PRESSED", "0")                                          # удаление выключено — только снимаем кнопки
+    n_del, n_edit = respx.calls.call_count, edit.call_count
+    assert await channels.delete_pressed_message("mid.1") is False and edit.call_count == n_edit + 1
+    assert respx.calls.call_count == n_del + 1

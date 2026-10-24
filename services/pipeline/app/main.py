@@ -233,6 +233,7 @@ async def process_max(parsed: dict) -> None:
             await channels.send_max(parsed["user_id"], m["text"], m.get("buttons"), md=m.get("md", False), image=m.get("image"))
         if parsed.get("callback_id"):
             await channels.answer_callback(parsed["callback_id"])
+        await channels.delete_pressed_message(parsed.get("message_id"))
         max_poller.state["processed"] += 1
     except Exception as e:  # noqa: BLE001 — сбой одного события не должен останавливать канал
         max_poller.state["last_error"] = f"обработка/отправка: {e}"[:300]

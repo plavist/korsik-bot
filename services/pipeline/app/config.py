@@ -52,3 +52,8 @@ def internal_token() -> str:
     """Токен для админских маршрутов pipeline (их вызывает только сервис admin)."""
     import hashlib
     return hashlib.sha256(("internal:" + os.getenv("ADMIN_PASSWORD", "admin")).encode()).hexdigest()
+
+
+def delete_pressed() -> bool:
+    """Удалять ли в MAX сообщение, под которым нажата кнопка (MAX_DELETE_PRESSED=0 — не удалять)."""
+    return os.getenv("MAX_DELETE_PRESSED", "1") not in ("0", "false", "no")
