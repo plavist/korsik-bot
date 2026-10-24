@@ -2,6 +2,7 @@ import asyncio
 import contextlib
 import hmac
 import json
+import os
 import re
 from contextlib import asynccontextmanager
 from datetime import date, datetime
@@ -14,7 +15,7 @@ from fastapi.exceptions import RequestValidationError
 
 from . import sentiment as sentiment_mod
 from . import validation as V
-from . import agent, assets, bot, channels, commands, config, db, engine, insights, locks, max_poller, scenario_edit
+from . import agent, assets, bot, channels, commands, config, db, engine, handoff, insights, locks, max_poller, scenario_edit
 from . import scenario as sc
 
 
@@ -253,7 +254,8 @@ async def run_event(event_id: int, parsed: dict) -> None:
             await _send_with_retry(parsed["user_id"], m)
         if parsed.get("callback_id"):
             await channels.answer_callback(parsed["callback_id"])
-        await channels.delete_pressed_message(parsed.get("message_id"))
+        if not res.get("keep"):
+            await channels.delete_pressed_message(parsed.get("message_id"))
         max_poller.state["processed"] += 1
         db.inbox_done(event_id)
     except Exception as e:  # noqa: BLE001 — сбой одного события не должен останавливать канал
@@ -552,6 +554,30 @@ async def escalations(status: str | None = None):
     return db.list_escalations(status)
 
 
+class RecipientsIn(DigestSettings):
+    """Получатели обращений HR в МАКС — те же правила проверки, что у получателей дайджеста."""
+
+
+@app.get("/api/escalations/recipients", dependencies=ADMIN)
+async def escalation_recipients():
+    return {"recipients": db.get_setting("hr_recipients", ""), "from_env": os.getenv("HR_MAX_IDS", ""), "active": handoff.recipients()}
+
+
+@app.put("/api/escalations/recipients", dependencies=ADMIN)
+async def set_escalation_recipients(body: RecipientsIn):
+    db.set_setting("hr_recipients", body.recipients)
+    return {"ok": True, "active": handoff.recipients()}
+
+
+@app.post("/api/escalations/recipients/test", dependencies=ADMIN)
+async def test_escalation_recipients():
+    """Тестовое сообщение каждому получателю: видно, кто ещё не нажал «Начать» у бота."""
+    ids = handoff.recipients()
+    if not ids:
+        raise HTTPException(409, "получатели не заданы")
+    return {"results": [{"user_id": uid, "delivered": await handoff.send_test(uid)} for uid in ids]}
+
+
 @app.post("/api/escalations/{esc_id}/status", dependencies=ADMIN)
 async def escalation_status(esc_id: int, body: StatusIn):
     if not db.set_escalation_status(esc_id, body.status):
@@ -573,17 +599,7 @@ async def escalation_reply(esc_id: int, body: ReplyIn):
     esc = db.get_escalation(esc_id)
     if not esc:
         raise HTTPException(404, "not found")
-    text = body.text
-    db.add_message(esc["user_id"], esc["channel"], "hr", text)
-    if esc["status"] == "open":
-        db.set_escalation_status(esc_id, "in_progress")
-    delivered, error = True, None
-    if esc["channel"] == "max":
-        try:
-            await channels.send_max(esc["user_id"], f"Ответ HR-специалиста:\n{text}")
-        except Exception as e:  # noqa: BLE001
-            delivered, error = False, str(e)[:200]
-    return {"ok": True, "delivered": delivered, "error": error}
+    return await handoff.deliver_reply(esc, body.text)
 
 
 # ---------- онбординг: сотрудники и сценарий (только через панель управления) ----------

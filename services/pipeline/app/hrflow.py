@@ -8,7 +8,7 @@
 import json
 import os
 
-from . import db
+from . import db, handoff
 from . import scenario as sc
 
 FORWARD_REPLY = "Передал! Коллеги из подбора персонала свяжутся с тобой 🤝"
@@ -46,7 +46,7 @@ def _save(user_id: str, st: dict) -> None:
 
 def escalate(user_id: str, channel: str, kind: str, reason: str) -> int:
     """Сразу создаёт обращение для HR (панель управления → «Эскалации»)."""
-    return db.add_escalation(user_id, channel, reason.strip()[:1500], kind)
+    return handoff.create_escalation(user_id, channel, reason, kind)
 
 
 def awaiting(user_id: str) -> bool:

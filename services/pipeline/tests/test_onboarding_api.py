@@ -7,7 +7,7 @@ import respx
 
 from app import channels, db, engine, main, max_poller
 from app.main import deliver, process_max, scheduler_loop
-from helpers import GW, ING, llm_reply
+from helpers import GW, ING, llm_reply, tool_call
 from test_api import anon, client
 from test_onboarding import llm_router, make_emp
 
@@ -209,7 +209,14 @@ def test_unanswerable_question_is_silently_escalated_and_grounded_has_no_buttons
     r = anon.post("/api/chat", json={"user_id": u, "message": "Какой пароль от wifi?"}).json()
     assert r["messages"] == [] and not r["grounded"]          # в чат ничего, вопрос сразу у HR
     assert [e["kind"] for e in client.get("/api/escalations").json()] == ["unanswered"]
-    llm_router()                                              # не по теме (поиска не было) — обычный ответ, HR не беспокоим
+    def chat(req):                                            # не по теме: модель вызывает off_topic — обычный ответ, HR не беспокоим
+        body = json.loads(req.content)
+        if body.get("response_format"):
+            return llm_reply(json.dumps({"sentiment": "neutral", "score": 0, "topics": ["другое"], "red_flag": False}))
+        if not any(x["role"] == "tool" and "принято" in x["content"] for x in body["messages"]):
+            return llm_reply(tool_calls=[tool_call("off_topic", {})])
+        return llm_reply("Это не по моей части, но желаю приятного вечера 🙂")
+    respx.post(GW).mock(side_effect=chat)
     assert anon.post("/api/chat", json={"user_id": u, "message": "Посоветуй сериал"}).json()["messages"][0]["buttons"] is None
     assert len(client.get("/api/escalations").json()) == 1
     llm_router(kb_text="Ответ")

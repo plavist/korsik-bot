@@ -161,6 +161,10 @@
   </section>
 
   <section id="esc" data-perm="escalations" class="hide">
+    <div class="card" id="hrcard"><h2>Обращения HR прямо в МАКС</h2>
+      <p class="muted" style="margin-top:0">Новое обращение приходит перечисленным HR-специалистам в МАКС с кнопками «Ответить», «Взять в работу» и «Закрыть обращение». Ответ из МАКС уходит сотруднику в тот же чат; пока HR ведёт диалог, бот сам не отвечает, а пересылает сообщения сотрудника HR. Каждый получатель один раз нажимает «Начать» у бота; свой ID покажет команда <code>/myid</code>.</p>
+      <div class="form"><label>MAX ID получателей через запятую<input type="text" id="hr_rcp" size="34" maxlength="500" placeholder="123456789, 987654321" pattern="\s*[A-Za-z0-9_\-]+(\s*,\s*[A-Za-z0-9_\-]+){0,19}\s*,?\s*|" title="ID через запятую, не больше 20"></label>
+        <button class="b" id="hr_save">Сохранить</button><button class="s" id="hr_test">Отправить тест</button><span id="hr_msg" class="muted"></span></div></div>
     <div class="card"><h2>Обращения к HR</h2>
       <div class="filters"><label class="fl">Статус<select id="xf_status"><option value="">Все</option><option value="open">Открыто</option><option value="in_progress">В работе</option><option value="resolved">Решено</option></select></label>
         <label class="fl">Площадка<select id="xf_site"><option value="">Все площадки</option></select></label>
@@ -561,7 +565,24 @@ $('#dg_send').onclick = async () => {
 
 const TONE = { positive: '✓ Положительно', neutral: '● Обращение', danger: '⚠ Опасно' }, ESC_STATUS = { open: 'Открыто', in_progress: 'В работе', resolved: 'Решено' };
 let ESC = [];
-async function loadEsc() { ESC = await (await api('pipeline', 'api/escalations')).json(); renderEsc(); }
+async function loadEsc() { ESC = await (await api('pipeline', 'api/escalations')).json(); renderEsc(); hrRecipients(); }
+async function hrRecipients() {
+  const r = await (await api('pipeline', 'api/escalations/recipients')).json();
+  if (document.activeElement !== $('#hr_rcp')) $('#hr_rcp').value = r.recipients;
+  $('#hr_msg').textContent = r.active.length ? `Получателей: ${r.active.length}${r.from_env ? ' (часть задана на сервере: ' + r.from_env + ')' : ''}` : 'Получатели не заданы: обращения видны только здесь';
+}
+$('#hr_save').onclick = async () => {
+  if (!vOk($('#hr_rcp'))) return;
+  const r = await api('pipeline', 'api/escalations/recipients', { method: 'PUT', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ recipients: $('#hr_rcp').value }) });
+  if (!r.ok) { toast('Ошибка: ' + ((await r.json()).detail || r.status), 'err'); return; }
+  toast('Получатели сохранены'); hrRecipients();
+};
+$('#hr_test').onclick = async () => {
+  const r = await api('pipeline', 'api/escalations/recipients/test', { method: 'POST' });
+  if (!r.ok) { toast('Ошибка: ' + ((await r.json()).detail || r.status), 'err'); return; }
+  const res = (await r.json()).results, bad = res.filter(x => !x.delivered).map(x => x.user_id);
+  toast(bad.length ? `Не доставлено: ${bad.join(', ')} — пусть нажмут «Начать» у бота` : 'Тест доставлен всем получателям', bad.length ? 'err' : undefined);
+};
 function renderEsc() {
   const st = $('#xf_status').value, site = $('#xf_site').value, tone = $('#xf_tone').value, q = $('#xf_q').value.trim().toLowerCase();
   const rows = ESC.filter(e => (!st || e.status === st) && (!site || e.site === site) && (!tone || e.tone === tone) && (!q || `${e.name || ''} ${e.user_id} ${e.message}`.toLowerCase().includes(q)));
@@ -580,7 +601,7 @@ async function loadDlg() {
   if (!curEsc) return;
   const d = await (await api('pipeline', `api/escalations/${curEsc}`)).json(), e = d.escalation;
   $('#dtitle').replaceChildren(`Обращение №${e.id} · `, nm(e.name, e.user_id));
-  $('#dmeta').textContent = `MAX ID ${e.user_id} · ${e.site ? siteName(e.site) + ' · ' : ''}${KINDS[e.kind] || e.kind} · ${ESC_STATUS[e.status] || e.status} · ${e.reason}`;
+  $('#dmeta').textContent = `MAX ID ${e.user_id} · ${e.site ? siteName(e.site) + ' · ' : ''}${KINDS[e.kind] || e.kind} · ${ESC_STATUS[e.status] || e.status}${e.assignee ? ' · ведёт HR (MAX ID ' + e.assignee + ')' : ''}${e.repeats > 1 ? ' · повторов: ' + e.repeats : ''} · ${e.reason}`;
   const who = { user: 'Сотрудник', assistant: 'Корсик', hr: 'HR' };
   const box = $('#chat'), atBottom = box.scrollTop + box.clientHeight >= box.scrollHeight - 30;
   box.innerHTML = d.messages.map(m => `<div class="m ${m.role}"><small>${who[m.role] || m.role} · ${fmt(m.created_at)}</small>${esc(m.text)}</div>`).join('');

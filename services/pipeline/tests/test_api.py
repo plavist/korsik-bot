@@ -107,10 +107,14 @@ def test_escalation_dialog_and_reply_web():
     assert db.get_escalation(esc["id"])["status"] == "in_progress"
     h = anon.get(f"/api/history/{u}").json()
     assert h[-1]["role"] == "hr" and h[-1]["text"] == "Привет, я HR, помогу" and "id" in h[-1]
-    llm = respx.post(GW).mock(return_value=llm_reply("ок"))  # HR-реплика попадает в контекст модели
-    anon.post("/api/chat", json={"user_id": u, "message": "спасибо"})
-    msgs = json.loads(llm.calls[0].request.content)["messages"]
-    assert any(m["content"].startswith("[Ответ HR-специалиста]") for m in msgs)
+    llm = respx.post(GW).mock(return_value=llm_reply("ок"))
+    r = anon.post("/api/chat", json={"user_id": u, "message": "спасибо"}).json()
+    assert r["messages"] == [] and all(json.loads(c.request.content).get("response_format") for c in llm.calls)   # HR ведёт диалог — бот молчит (модель вызвана только для анализа тональности)
+    assert anon.get(f"/api/history/{u}").json()[-1]["text"] == "спасибо"
+    client.post(f"/api/escalations/{esc['id']}/status", json={"status": "resolved"})   # обращение закрыли — бот снова отвечает
+    anon.post("/api/chat", json={"user_id": u, "message": "а ещё вопрос"})
+    agent_calls = [json.loads(c.request.content) for c in llm.calls if not json.loads(c.request.content).get("response_format")]
+    assert any(m["content"].startswith("[Ответ HR-специалиста]") for m in agent_calls[0]["messages"])    # HR-реплика попадает в контекст модели
 
 
 # ---------- MAX ----------

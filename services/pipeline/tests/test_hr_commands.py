@@ -46,11 +46,12 @@ async def test_technical_failure_is_not_silent_escalation():
 
 @respx.mock
 async def test_agent_escalation_is_immediate_and_reply_has_no_buttons():
+    respx.post(ING).mock(return_value=httpx.Response(200, json=[]))
     def side(req):
         body = json.loads(req.content)
         if body.get("response_format"):
             return llm_reply(json.dumps({"sentiment": "neutral", "score": 0, "topics": ["зарплата и выплаты"], "red_flag": False}))
-        if not any(m["role"] == "tool" for m in body["messages"]):
+        if not any(m["role"] == "tool" and "передано" in m["content"] for m in body["messages"]):   # поиск уже выполнен сервером
             return llm_reply(tool_calls=[tool_call("escalate_to_hr", {"reason": "Вопрос о зарплате"})])
         return llm_reply("Это вопрос для HR — я передал его коллегам, они скоро свяжутся.")
     respx.post(GW).mock(side_effect=side)
@@ -234,6 +235,7 @@ def test_fix_formal_case_after_numbers_and_sentences():
 
 @respx.mock
 async def test_agent_reply_is_fixed_to_masculine_and_formal_rewrite_capitalised():
+    respx.post(ING).mock(return_value=httpx.Response(200, json=[]))
     respx.post(GW).mock(return_value=llm_reply("Спасибо. Я передала твой вопрос коллегам."))
     assert (await agent.answer("x", "web", "q"))["reply"] == "Спасибо. Я передал твой вопрос коллегам."
     respx.post(GW).mock(return_value=llm_reply("1. вам понятны поставленные задачи?"))

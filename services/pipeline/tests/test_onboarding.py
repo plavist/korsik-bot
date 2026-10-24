@@ -392,8 +392,8 @@ async def test_scale_edge_cases_and_yesno_text_answers():
     msgs = await engine.send_now(emp, "d14_check")
     res = await bot.handle("e1", "web", text="да")                        # текстом «да»
     assert res["messages"][0]["text"].startswith("2.")
-    res = await bot.handle("e1", "web", text="может быть")                # не распознано → агент
-    assert "базе знаний нет ответа" in res["reply"]
+    res = await bot.handle("e1", "web", text="может быть")                # не распознано → агент: ответа в базе нет → молчим, вопрос у HR
+    assert res["reply"] == "" and [e["kind"] for e in db.list_escalations()] == ["unanswered"]
     await bot.handle("e1", "web", text="Да")
     res = await bot.handle("e1", "web", payload="s:d14_check:3:11")       # вне диапазона
     assert res["messages"][0]["text"] == "Нужна цифра от 1 до 10 🙂"
@@ -420,7 +420,7 @@ async def test_choice_and_multi_text_answers_and_open_text_step():
     assert "Выбрано: 1" in res["messages"][0]["text"]
     res = await bot.handle("t1", "web", text="готово")
     assert res["messages"][0]["text"].startswith("3) Что помогло бы")
-    assert (await bot.handle("t1", "web", text="что-то другое"))["reply"].startswith("В базе знаний нет")   # не вариант → агент
+    assert (await bot.handle("t1", "web", text="что-то другое"))["reply"] == ""   # не вариант → агент: ответа нет — вопрос ушёл HR
     res = await bot.handle("t1", "web", text="Помощь коллег")           # одиночный выбор по названию
     assert res["messages"][0]["text"] == "Спасибо за обратную связь! "
 

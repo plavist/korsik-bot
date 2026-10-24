@@ -1,7 +1,7 @@
 """Единая точка обработки входящих (web и MAX): команды → «Передать HR» → сценарий/опросы → RAG-агент."""
 import re
 
-from . import agent, commands, db, engine, hrflow, intent, locks, sentiment, style
+from . import agent, commands, db, engine, handoff, hrflow, intent, locks, sentiment, style
 
 HR_LABELS = {"hr:forward": "Передать HR через Корсика", "hr:cancel": "Не передавать", "hr:contact": "Связаться с рекрутером"}
 STALE = "Этот вопрос уже пройден 🙂"
@@ -24,13 +24,23 @@ async def _scenario_or_question(user_id, channel, text, payload, emp, res) -> in
     if payload:  # кнопка без активного вопроса
         res["messages"] = [engine.msg(STALE)]
         return None
+    if handoff.human_engaged(user_id):  # диалог ведёт живой HR: бот молчит, а сообщение уходит HR в МАКС
+        handoff._spawn(handoff.forward_followup(user_id, text))
+        res["messages"] = []
+        return msg_id
     answer = await _free_question(user_id, channel, text, emp, res)
     res["messages"] = [answer] if answer else []   # нет ответа в базе — в чат ничего не пишем, вопрос уже у HR
     return msg_id
 
 
 async def _route(user_id, channel, text, payload, emp, res) -> int | None:
-    """Выбирает обработчик входящего: кнопка HR → команда «/» → текст обращения → сценарий и вопросы. → id сообщения для анализа."""
+    """Выбирает обработчик входящего: действие HR → кнопка HR → команда «/» → текст обращения → сценарий и вопросы.
+    → id сообщения для анализа."""
+    if handoff.is_hr(user_id):  # сотрудник HR отвечает на обращение прямо в МАКС
+        hr = await handoff.handle_hr(user_id, text, payload)
+        if hr is not None:
+            res["messages"], res["keep"] = hr, True     # кнопки уведомления не удаляем: ими пользуются несколько раз
+            return None
     if payload and payload.startswith("hr:"):
         db.add_message(user_id, channel, "user", f"[кнопка] {HR_LABELS.get(payload, payload)}")
         res["messages"] = await _hr_payload(user_id, channel, payload, emp)
@@ -92,6 +102,8 @@ async def _hr_payload(user_id: str, channel: str, payload: str, emp: dict | None
 
 async def _command(user_id: str, channel: str, text: str, emp: dict | None) -> list[dict]:
     cmd, _, arg = text.partition(" ")
+    if cmd.lower() == "/myid":  # служебная команда: показывает MAX ID — его вписывают в получатели обращений HR
+        return [engine.msg(f"Ваш MAX ID: {user_id}")]
     row = commands.get(cmd)
     if not row:
         return [engine.msg("Не знаю такой команды 🙈 Список команд — /help")]

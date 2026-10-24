@@ -9,7 +9,7 @@ import time
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
-from . import agent, assets, db, hrflow, locks, style
+from . import agent, assets, db, handoff, hrflow, locks, style
 from . import scenario as sc
 
 TZ = ZoneInfo("Europe/Moscow")
@@ -154,7 +154,7 @@ async def _advance(emp: dict, step: dict, nxt: int, prefix: list[dict]) -> list[
 
 
 def _escalate(emp: dict, step: dict, reason: str) -> None:
-    db.add_escalation(emp["user_id"], emp["channel"] or "web", f"{reason} (этап «{step['title']}»)", "survey")
+    handoff.create_escalation(emp["user_id"], emp["channel"] or "web", f"{reason} (этап «{step['title']}»)", "survey")
 
 
 async def _apply_option(emp, step, idx, it, opt) -> dict:

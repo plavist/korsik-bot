@@ -2,7 +2,7 @@
 import json
 import re
 
-from . import db, llm
+from . import db, handoff, llm
 
 TOPICS = ["доступы и ИТ", "документы и оформление", "график и отпуск", "зарплата и выплаты",
           "адаптация и задачи", "коллектив и коммуникации", "конфликт или токсичность",
@@ -44,5 +44,5 @@ async def analyze_and_store(msg_id: int, user_id: str, channel: str, text: str) 
         return None
     db.set_sentiment(msg_id, res["sentiment"], res["score"], res["topics"], res["red_flag"])
     if res["red_flag"]:
-        db.add_escalation(user_id, channel, f"Красный флаг: {res['reason'] or text[:200]}", "sentiment")
+        handoff.create_escalation(user_id, channel, f"Красный флаг: {res['reason'] or text[:200]}", "sentiment")
     return res

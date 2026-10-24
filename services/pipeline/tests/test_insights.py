@@ -2,6 +2,7 @@
 import json
 import time
 from datetime import date, datetime
+from zoneinfo import ZoneInfo
 
 import httpx
 import pytest
@@ -59,7 +60,7 @@ def test_drill_filters_and_user_history():
     assert [r["text"] for r in db.messages_drill(sentiment="negative", site="GTP")] == ["Хочу уволиться", "Меня обижает наставник"]
     assert len(db.messages_drill(red_flag=True)) == 2 and db.messages_drill(red_flag=True)[0]["red_flag"] is True
     assert [r["text"] for r in db.messages_drill(topic="увольнение")] == ["Хочу уволиться"]
-    today = date.today().isoformat()
+    today = datetime.now(ZoneInfo("Europe/Moscow")).date().isoformat()     # дни в аналитике считаются по московскому времени
     assert len(db.messages_drill(day=today)) == 3 and len(db.messages_drill(user_id="ua")) == 2
     assert db.messages_drill(days=7, manager="Иванов")[0]["name"] == "Анна Петрова"
     assert db.user_history("ua")[0]["text"] == "Старый вопрос" or db.user_history("ua")

@@ -67,9 +67,9 @@ MERGE_WINDOW = 24 * 3600                                      # повторы �
 MERGE_KINDS = ("unanswered", "sentiment", "agent", "intent")   # автоматические обращения; явные просьбы и опросы — отдельные
 
 
-def add_escalation(user_id, channel, reason, kind, merge: bool | None = None) -> int:
-    """Создаёт обращение для HR. Автоматические обращения (нет ответа в базе, красный флаг, решение модели, интент): если у
-    сотрудника уже есть незакрытое обращение того же вида за последние сутки, новая причина дописывается в него
+def add_escalation_ex(user_id, channel, reason, kind, merge: bool | None = None) -> tuple[int, bool]:
+    """→ (id обращения, создано ли новое). Автоматические обращения (нет ответа в базе, красный флаг, решение модели, интент):
+    если у сотрудника уже есть незакрытое обращение того же вида за последние сутки, новая причина дописывается в него
     (счётчик повторов растёт) — HR не получает поток дублей. Явные просьбы и сигналы из опросов создаются отдельно."""
     now = time.time()
     with conn() as c:
@@ -79,9 +79,35 @@ def add_escalation(user_id, channel, reason, kind, merge: bool | None = None) ->
             if row:
                 merged = row["reason"] if reason in (row["reason"] or "") else f"{row['reason']}\n{reason}"[:3000]
                 c.execute("UPDATE escalations SET reason=%s, repeats=repeats+1, updated_at=%s WHERE id=%s", (merged, now, row["id"]))
-                return row["id"]
-        return c.execute("INSERT INTO escalations(user_id,channel,reason,kind,created_at,updated_at) VALUES(%s,%s,%s,%s,%s,%s) RETURNING id",
-                         (user_id, channel, reason, kind, now, now)).fetchone()["id"]
+                return row["id"], False
+        new_id = c.execute("INSERT INTO escalations(user_id,channel,reason,kind,created_at,updated_at) VALUES(%s,%s,%s,%s,%s,%s) RETURNING id",
+                           (user_id, channel, reason, kind, now, now)).fetchone()["id"]
+        return new_id, True
+
+
+def add_escalation(user_id, channel, reason, kind, merge: bool | None = None) -> int:
+    return add_escalation_ex(user_id, channel, reason, kind, merge)[0]
+
+
+def set_escalation_assignee(esc_id: int, assignee: str | None) -> None:
+    with conn() as c:
+        c.execute("UPDATE escalations SET assignee=%s WHERE id=%s", (assignee, esc_id))
+
+
+def open_escalation(user_id: str) -> dict | None:
+    """Последнее незакрытое обращение сотрудника."""
+    with conn() as c:
+        r = c.execute(ESC_SELECT + " WHERE e.user_id=%s AND e.status<>'resolved' ORDER BY e.id DESC LIMIT 1", (user_id,)).fetchone()
+        return _esc(r) if r else None
+
+
+def human_engaged(user_id: str, hours: float) -> bool:
+    """HR ведёт диалог: обращение «в работе» и за последние `hours` часов HR писал сотруднику."""
+    with conn() as c:
+        return c.execute(
+            "SELECT 1 FROM escalations e WHERE e.user_id=%s AND e.status='in_progress' AND EXISTS ("
+            "  SELECT 1 FROM messages m WHERE m.user_id=e.user_id AND m.role='hr' AND m.created_at >= %s) LIMIT 1",
+            (user_id, time.time() - hours * 3600)).fetchone() is not None
 
 
 def upsert_user(user_id: str, name: str | None, channel: str) -> None:
@@ -204,7 +230,7 @@ def analytics(days: int | None = None, site: str | None = None, manager: str | N
                 d["n"] += 1
                 d["neg"] += r["sentiment"] == "negative"
         daily = [dict(r) for r in c.execute(
-            "SELECT to_char(to_timestamp(created_at) AT TIME ZONE 'UTC', 'YYYY-MM-DD') AS day, COUNT(*) AS n, "
+            "SELECT to_char(to_timestamp(created_at) AT TIME ZONE 'Europe/Moscow', 'YYYY-MM-DD') AS day, COUNT(*) AS n, "
             "SUM((sentiment='negative')::int) AS neg, SUM((sentiment IN ('neutral','positive'))::int) AS neu, "
             f"ROUND(AVG(sentiment_score)::numeric, 2) AS avg FROM messages WHERE {SCORED}" + uflt +
             " GROUP BY day ORDER BY day DESC LIMIT 60", ufa)]
@@ -252,7 +278,7 @@ def messages_drill(days=None, site=None, manager=None, topic=None, sentiment=Non
     if red_flag:
         q += " AND red_flag=1"
     if day:
-        q, fa = q + " AND to_char(to_timestamp(created_at) AT TIME ZONE 'UTC', 'YYYY-MM-DD')=%s", fa + [day]
+        q, fa = q + " AND to_char(to_timestamp(created_at) AT TIME ZONE 'Europe/Moscow', 'YYYY-MM-DD')=%s", fa + [day]
     if user_id:
         q, fa = q + " AND user_id=%s", fa + [user_id]
     if topic:

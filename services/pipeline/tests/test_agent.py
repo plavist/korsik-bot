@@ -48,6 +48,7 @@ async def test_agent_search_service_down_reported_to_llm():
 
 @respx.mock
 async def test_agent_escalates():
+    respx.post(ING).mock(return_value=httpx.Response(200, json=[]))                  # поиск по базе выполняется всегда — ничего не нашёл
     respx.post(GW).mock(side_effect=[
         llm_reply(tool_calls=[tool_call("escalate_to_hr", {"reason": "Хочу обсудить зарплату"})]),
         llm_reply("Передал HR."),
@@ -102,9 +103,59 @@ async def test_agent_empty_reply_default():
 async def test_agent_includes_history():
     db.add_message("u", "web", "user", "привет")
     db.add_message("u", "web", "assistant", "здравствуй")
+    respx.post(ING).mock(return_value=httpx.Response(200, json=[]))
     llm = respx.post(GW).mock(return_value=llm_reply("ok"))
     await agent.answer("u", "web", "что дальше?")
     msgs = json.loads(llm.calls[0].request.content)["messages"]
-    assert [m["role"] for m in msgs] == ["system", "user", "assistant", "user"]
-    assert all(set(m) == {"role", "content"} and isinstance(m["content"], str) for m in msgs)  # формат OpenAI API
-    assert msgs[1]["content"] == "привет"
+    # история диалога, вопрос и выполненный сервером поиск (как вызов инструмента и его результат)
+    assert [m["role"] for m in msgs] == ["system", "user", "assistant", "user", "assistant", "tool"]
+    assert all(isinstance(m["content"], str) and {"role", "content"} <= set(m) for m in msgs)  # формат OpenAI API
+    assert msgs[1]["content"] == "привет" and msgs[4]["tool_calls"][0]["id"] == msgs[5]["tool_call_id"] == "forced-search"
+
+
+# ---------- нестандартный вопрос всегда доходит до HR ----------
+@respx.mock
+async def test_question_answered_from_model_memory_without_search_still_goes_to_hr():
+    """Модель «из головы» отвечает на рабочий вопрос и не вызывает поиск — сервер всё равно ищет в базе сам; ничего нет → вопрос HR."""
+    search = respx.post(ING).mock(return_value=httpx.Response(200, json=[]))
+    respx.post(GW).mock(return_value=llm_reply("Обычно премии выплачивают в конце квартала."))     # выдумка вместо поиска
+    res = await agent.answer("u1", "web", "Когда выплачивают квартальную премию?")
+    assert search.called and not res["grounded"] and res["hr_options"] and not res["failed"]      # bot.py отправит вопрос HR и не покажет выдумку
+
+
+@respx.mock
+async def test_forced_search_result_is_shown_to_model_as_its_own_tool_call():
+    respx.post(ING).mock(return_value=httpx.Response(200, json=[hit(text="Отпуск 28 календарных дней")]))
+    llm = respx.post(GW).mock(return_value=llm_reply("28 календарных дней (ПВТР)."))
+    res = await agent.answer("u1", "web", "Сколько дней отпуска?")
+    msgs = json.loads(llm.calls[0].request.content)["messages"]
+    assert res["grounded"] and not res["hr_options"] and len(llm.calls) == 1                       # модель сразу отвечает по найденному
+    assert "Отпуск 28 календарных дней" in msgs[-1]["content"] and msgs[-2]["tool_calls"][0]["function"]["name"] == "search_knowledge_base"
+
+
+@respx.mock
+async def test_off_topic_tool_keeps_hr_out_and_small_talk_skips_search():
+    search = respx.post(ING).mock(return_value=httpx.Response(200, json=[]))
+    respx.post(GW).mock(side_effect=[llm_reply(tool_calls=[tool_call("off_topic", {})]), llm_reply("Не по моей части, но хорошего вечера 🙂")])
+    res = await agent.answer("u1", "web", "Посоветуй сериал")
+    assert search.called and not res["grounded"] and not res["hr_options"] and res["reply"].startswith("Не по моей части")
+    search.reset()
+    respx.post(GW).mock(return_value=llm_reply("Рад помочь 🙂"))
+    for hello in ("Привет!", "спасибо большое", "Ок, понятно", "Доброе утро", "  ", "Жду."):
+        res = await agent.answer("u1", "web", hello)
+        assert not res["hr_options"], hello                                                       # болтовня HR не беспокоит
+    assert not search.called                                                                      # и поиск для неё не нужен
+
+
+def test_needs_search_only_skips_small_talk():
+    assert not any(agent.needs_search(t) for t in ("Привет", "Спасибо!", "ок", "Понятно, спасибо большое", "Добрый день", "", None))
+    assert all(agent.needs_search(t) for t in ("Привет, а где столовая?", "Как оформить командировку", "спасибо, но я не понял про отпуск",
+                                              "Мне не выдали пропуск", "Хочу уволиться"))
+
+
+@respx.mock
+async def test_empty_model_reply_gets_a_friendly_hint():
+    respx.post(ING).mock(return_value=httpx.Response(200, json=[hit()]))
+    respx.post(GW).mock(return_value=llm_reply(""))
+    res = await agent.answer("u1", "web", "Сколько дней отпуска?")
+    assert res["grounded"] and res["reply"].startswith("Не нашёл, что ответить")

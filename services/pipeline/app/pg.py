@@ -21,6 +21,9 @@ CREATE INDEX IF NOT EXISTS ix_msg_created ON messages(created_at);
 CREATE TABLE IF NOT EXISTS escalations (
   id BIGSERIAL PRIMARY KEY, user_id TEXT, channel TEXT, reason TEXT, kind TEXT,
   status TEXT DEFAULT 'open', created_at DOUBLE PRECISION, repeats INTEGER DEFAULT 1, updated_at DOUBLE PRECISION);
+ALTER TABLE escalations ADD COLUMN IF NOT EXISTS repeats INTEGER DEFAULT 1;
+ALTER TABLE escalations ADD COLUMN IF NOT EXISTS updated_at DOUBLE PRECISION;
+ALTER TABLE escalations ADD COLUMN IF NOT EXISTS assignee TEXT;
 CREATE INDEX IF NOT EXISTS ix_esc_user ON escalations(user_id, status);
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT);
 CREATE TABLE IF NOT EXISTS employees (
