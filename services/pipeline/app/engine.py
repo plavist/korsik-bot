@@ -2,15 +2,14 @@
 
 Сообщение — {"text": str, "buttons": [[{"text", "payload"}]] | None}; доставку (web/MAX) делает слой выше.
 Формат payload кнопок: a:<step>:<idx>:<value> (выбор) · m:…:<value|done> (мульти) · o:<step>:<idx> («свой вариант»)
-· s:…:<1-10> (шкала) · y:…:yes|no. Кнопки «Передать HR» (hr:*) обрабатывает hrflow.
+· s:…:<1-10> (шкала) · y:…:yes|no. Кнопки «Передать HR через Корсика» / «Связаться с рекрутером» (hr:*) обрабатывает hrflow.
 """
-import os
 import secrets
 import time
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
-from . import agent, assets, db, hrflow, style
+from . import agent, assets, db, hrflow, locks, style
 from . import scenario as sc
 
 TZ = ZoneInfo("Europe/Moscow")
@@ -127,7 +126,7 @@ async def run_items(emp: dict, step: dict, start: int = 0) -> tuple[list[dict], 
 
 async def finalize(emp: dict, msgs: list[dict]) -> list[dict]:
     texts = await style.personalize_many([m["text"] for m in msgs], emp)
-    return [{**m, "text": t} for m, t in zip(msgs, texts)]
+    return [{**m, "text": t} for m, t in zip(msgs, texts, strict=True)]
 
 
 def _save(emp: dict) -> None:
@@ -229,12 +228,16 @@ async def _payload_answer(emp: dict, payload: str) -> dict:
     if kind == "s" and aw == "scale" and value and value.isdigit():
         return await _scale(emp, step, idx, it, int(value))
     if kind == "y" and aw == "yesno" and value in ("yes", "no"):
-        _record(emp, step, it, "yesno", value, "Да" if value == "yes" else "Нет")
-        if value == "no":
-            p["awaiting"] = "reason"
-            return {"msgs": [msg(sc.REASON_PROMPT)], "echo": "Нет", "analyze": False}
-        return {"msgs": await _advance(emp, step, idx + 1, []), "echo": "Да", "analyze": False}
+        return await _yesno(emp, step, idx, it, value)
     return stale
+
+
+async def _yesno(emp, step, idx, it, value) -> dict:
+    _record(emp, step, it, "yesno", value, "Да" if value == "yes" else "Нет")
+    if value == "no":
+        emp["state"]["pending"]["awaiting"] = "reason"
+        return {"msgs": [msg(sc.REASON_PROMPT)], "echo": "Нет", "analyze": False}
+    return {"msgs": await _advance(emp, step, idx + 1, []), "echo": "Да", "analyze": False}
 
 
 async def _multi(emp, step, idx, it, value) -> dict:
@@ -307,9 +310,10 @@ async def bind(emp: dict, user_id: str, channel: str) -> list[dict]:
 
 
 # ---------- расписание ----------
-def timeline(emp: dict, now: datetime | None = None) -> list[dict]:
+def timeline(emp: dict, now: datetime | None = None, status: dict | None = None) -> list[dict]:
+    """status — уже загруженные статусы этапов сотрудника (для массовых расчётов); без него читаются из базы."""
     now = now or now_local()
-    status = db.step_status(emp["id"])
+    status = db.step_status(emp["id"]) if status is None else status
     out = []
     for step in sc.STEPS:
         due = sc.due_at(step, emp)
@@ -328,46 +332,68 @@ def timeline(emp: dict, now: datetime | None = None) -> list[dict]:
     return out
 
 
+def _lock_key(emp: dict) -> str:
+    return emp["user_id"] or f"employee:{emp['id']}"
+
+
+async def _remind_if_stale(emp: dict, deliver) -> tuple[dict | None, int]:
+    """Брошенный опрос снимаем; о неотвеченном напоминаем (до MAX_REMINDERS раз). → (текущий вопрос или None, отправлено)."""
+    p = emp["state"].get("pending")
+    if p and time.time() - p["asked_at"] > ABANDON_AFTER:
+        emp["state"].pop("pending")
+        _save(emp)
+        return None, 0
+    if p and p.get("survey") and p["reminders"] < MAX_REMINDERS and time.time() - p["asked_at"] >= REMIND_AFTER * (p["reminders"] + 1):
+        p["reminders"] += 1
+        _save(emp)
+        await deliver(emp, await finalize(emp, [msg(sc.SURVEY_REMINDER)]))
+        return p, 1
+    return p, 0
+
+
+async def _send_due_steps(emp: dict, deliver, now: datetime, p: dict | None) -> int:
+    sent, status = 0, db.step_status(emp["id"])
+    for step in sc.STEPS:
+        if step["id"] in status or not sc.applies(step, emp):
+            continue
+        due = sc.due_at(step, emp)
+        if due is None or due > now or (step.get("gate") == "recruiter" and not emp["recruiter_ok"]):
+            continue
+        if now - due > STALE:
+            db.mark_step(emp["id"], step["id"], "skipped")
+            continue
+        if p and any(i["t"] in AWAITING for i in step["items"]):
+            continue  # предыдущий опрос ещё не пройден — не заваливаем новыми вопросами
+        try:
+            await deliver(emp, await send_step(emp, step))
+            sent += 1
+        except Exception:  # noqa: BLE001 — доставка не удалась: этап помечаем ошибкой, админ может повторить
+            db.mark_step(emp["id"], step["id"], "error")
+        p = emp["state"].get("pending")
+    return sent
+
+
 async def tick(deliver, now: datetime | None = None) -> int:
-    """Один проход планировщика: рассылает наступившие этапы и напоминания. deliver(emp, msgs) — доставка."""
+    """Один проход планировщика: рассылает наступившие этапы и напоминания. deliver(emp, msgs) — доставка.
+    Каждый сотрудник обрабатывается под своей блокировкой и со свежим состоянием: параллельно пришедшее сообщение не затрётся."""
     now = now or now_local()
     sent = 0
-    for emp in db.list_employees(only_bound_active=True):
-        status = db.step_status(emp["id"])
-        p = emp["state"].get("pending")
-        if p and time.time() - p["asked_at"] > ABANDON_AFTER:
-            emp["state"].pop("pending")
-            p = None
-            _save(emp)
-        if p and p.get("survey") and p["reminders"] < MAX_REMINDERS and time.time() - p["asked_at"] >= REMIND_AFTER * (p["reminders"] + 1):
-            p["reminders"] += 1
-            _save(emp)
-            await deliver(emp, await finalize(emp, [msg(sc.SURVEY_REMINDER)]))
-            sent += 1
-        for step in sc.STEPS:
-            if step["id"] in status or not sc.applies(step, emp):
+    for listed in db.list_employees(only_bound_active=True):
+        async with locks.user_lock(_lock_key(listed)):
+            emp = db.get_employee(listed["id"])
+            if not emp or not emp["active"] or not emp["user_id"]:
                 continue
-            due = sc.due_at(step, emp)
-            if due is None or due > now or (step.get("gate") == "recruiter" and not emp["recruiter_ok"]):
-                continue
-            if now - due > STALE:
-                db.mark_step(emp["id"], step["id"], "skipped")
-                continue
-            if p and any(i["t"] in AWAITING for i in step["items"]):
-                continue  # предыдущий опрос ещё не пройден — не заваливаем новыми вопросами
-            try:
-                await deliver(emp, await send_step(emp, step))
-                sent += 1
-            except Exception:  # noqa: BLE001 — доставка не удалась: этап помечаем ошибкой, админ может повторить
-                db.mark_step(emp["id"], step["id"], "error")
-            p = emp["state"].get("pending")
+            p, n = await _remind_if_stale(emp, deliver)
+            sent += n + await _send_due_steps(emp, deliver, now, p)
     return sent
 
 
 async def send_now(emp: dict, step_id: str) -> list[dict]:
     """Принудительная отправка этапа (кнопка в панели управления) — игнорирует время и отмашку рекрутера."""
-    emp["state"].pop("pending", None)
-    return await send_step(emp, sc.STEP_BY_ID[step_id])
+    async with locks.user_lock(_lock_key(emp)):
+        emp = db.get_employee(emp["id"]) or emp
+        emp["state"].pop("pending", None)
+        return await send_step(emp, sc.STEP_BY_ID[step_id])
 
 
 def next_step_id(emp: dict) -> str | None:

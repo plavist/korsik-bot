@@ -4,7 +4,7 @@
 from . import assets, commands, db
 from . import scenario as sc
 
-RUNTIME_TABLES = ("messages", "escalations", "users", "employees", "sent_steps", "survey_answers", "manager_notices")
+RUNTIME_TABLES = ("messages", "escalations", "users", "employees", "sent_steps", "survey_answers", "manager_notices", "inbox")
 KEEP_PREFIXES = ("imgname:", "maximg:")      # названия загруженных файлов и их токены в MAX
 KEEP_KEYS = ("max_marker",)                  # позиция чтения событий MAX (иначе старые события придут заново)
 
@@ -31,7 +31,8 @@ def reset() -> dict:
         counts["bot_commands"] = c.execute("DELETE FROM bot_commands").rowcount
         keys = [r["key"] for r in c.execute("SELECT key FROM settings")]
         drop = [k for k in keys if k not in KEEP_KEYS and not k.startswith(KEEP_PREFIXES)]
-        c.executemany("DELETE FROM settings WHERE key=?", [(k,) for k in drop])
+        if drop:
+            c.execute("DELETE FROM settings WHERE key = ANY(%s)", (drop,))
         counts["settings"] = len(drop)
     commands.ensure()                        # встроенные команды — как заложено
     steps = sc.default_steps()               # сценарий и площадки — исходные, вложения сохраняются
@@ -40,8 +41,6 @@ def reset() -> dict:
             if (st["id"], idx, it["t"]) in images:
                 it["image"] = images[(st["id"], idx, it["t"])]
     sc.save(steps)
-    with db.conn() as c:
-        c.execute("VACUUM")
     return {**counts, "images_kept": len(images), "steps": len(sc.STEPS), "sites": sc.ALL_SITES[:]}
 
 

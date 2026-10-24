@@ -85,3 +85,46 @@ def test_upstream_error_relayed_after_retries():
 def test_transport_error_502():
     respx.post("https://openrouter.ai/api/v1/chat/completions").mock(side_effect=httpx.ConnectError("boom"))
     assert client.post("/v1/chat/completions", json={"messages": []}).status_code == 502
+
+
+# ---------- учёт токенов и стоимости ----------
+@respx.mock
+def test_usage_is_recorded_per_day_kind_and_model_with_cost(monkeypatch):
+    monkeypatch.setenv("LLM_PRICE_IN", "0.5")      # за 1 млн токенов
+    monkeypatch.setenv("LLM_PRICE_OUT", "1.5")
+    monkeypatch.setenv("EMBED_PRICE", "0.1")
+    monkeypatch.setenv("PRICE_CURRENCY", "RUB")
+    respx.post("https://openrouter.ai/api/v1/chat/completions").mock(
+        return_value=httpx.Response(200, json={"choices": [], "usage": {"prompt_tokens": 1000, "completion_tokens": 200}}))
+    respx.post("https://openrouter.ai/api/v1/embeddings").mock(
+        return_value=httpx.Response(200, json={"data": [{"embedding": [0.1]}], "usage": {"prompt_tokens": 50, "total_tokens": 50}}))
+    for _ in range(2):
+        client.post("/v1/chat/completions", json={"messages": []})
+    client.post("/v1/embeddings", json={"input": ["a"]})
+    u = client.get("/usage?days=7").json()
+    assert u["totals"]["chat"] == {"requests": 2, "prompt_tokens": 2000, "completion_tokens": 400, "cost": pytest.approx(0.0016)}
+    assert u["totals"]["embed"]["prompt_tokens"] == 50 and u["currency"] == "RUB" and u["cost"] == 0.0016
+    assert {r["kind"] for r in u["rows"]} == {"chat", "embed"}
+
+
+@respx.mock
+def test_usage_without_prices_and_failed_or_unmetered_requests_are_safe(monkeypatch):
+    for k in ("LLM_PRICE_IN", "LLM_PRICE_OUT", "EMBED_PRICE"):
+        monkeypatch.delenv(k, raising=False)
+    respx.post("https://openrouter.ai/api/v1/chat/completions").mock(return_value=httpx.Response(200, json={"choices": []}))   # у провайдера нет usage
+    client.post("/v1/chat/completions", json={"messages": []})
+    respx.post("https://openrouter.ai/api/v1/embeddings").mock(return_value=httpx.Response(500, text="x"))
+    client.post("/v1/embeddings", json={"input": ["a"]})                                                                          # ошибка — не учитывается
+    u = client.get("/usage?days=99999").json()
+    assert u["days"] == 3650 and u["cost"] is None and u["totals"]["chat"]["requests"] == 1 and "embed" not in u["totals"]
+    assert client.get("/usage?days=0").json()["days"] == 1
+    assert client.get("/usage").json()["currency"] == "USD"
+
+
+@respx.mock
+def test_usage_accounting_failure_does_not_break_request(monkeypatch):
+    respx.post("https://openrouter.ai/api/v1/chat/completions").mock(
+        return_value=httpx.Response(200, json={"usage": {"prompt_tokens": 1, "completion_tokens": 1}}))
+    from app import main
+    monkeypatch.setattr(main.pg, "conn", lambda: (_ for _ in ()).throw(RuntimeError("db down")))
+    assert client.post("/v1/chat/completions", json={"messages": []}).status_code == 200

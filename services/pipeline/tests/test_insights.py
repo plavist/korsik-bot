@@ -19,7 +19,7 @@ def add(uid, text, sentiment="neutral", score=0.0, topics=("другое",), red
     db.set_sentiment(mid, sentiment, score, list(topics), red)
     if ts:
         with db.conn() as c:
-            c.execute("UPDATE messages SET created_at=? WHERE id=?", (ts, mid))
+            c.execute("UPDATE messages SET created_at=%s WHERE id=%s", (ts, mid))
     return mid
 
 
@@ -111,10 +111,73 @@ def test_risk_scores_and_factors():
     assert insights.risk(days=1)[0]["name"]
     # молчание больше 5 дней
     with db.conn() as c:
-        c.execute("UPDATE messages SET created_at=? WHERE user_id='ua'", (time.time() - 9 * 86400,))
+        c.execute("UPDATE messages SET created_at=%s WHERE user_id='ua'", (time.time() - 9 * 86400,))
     assert "молчит больше 5 дней" in {x["name"]: x for x in insights.risk()}["Анна Петрова"]["factors"]
     make_emp(user=None, name="Не подключён")
     assert "Не подключён" not in [x["name"] for x in insights.risk()]
+
+
+# ---------- светофор «Статус адаптации» ----------
+def test_status_traffic_lights():
+    a, b, _ = seed()
+    now = datetime(2026, 10, 24, 12, 0)
+    by = lambda **kw: {x["name"]: x for x in insights.status(now=now, **kw)}  # noqa: E731
+
+    s = by()
+    assert s["Борис Сидоров"]["light"] == "red" and "высокий риск ухода" in s["Борис Сидоров"]["reasons"][0]
+    assert s["Анна Петрова"]["light"] == "yellow" and "этап ждёт отправки" in " ".join(s["Анна Петрова"]["reasons"])  # этапы наступили, но не отправлены
+    assert [x["light"] for x in insights.status(now=now)][0] == "red"                                                # красные — первыми
+
+    # всё отправлено → зелёный и понятное «по плану»
+    db.update_employee(a["id"], recruiter_ok=True)
+    for t in engine.timeline(db.get_employee(a["id"]), now):
+        if t["status"] == "due":
+            db.mark_step(a["id"], t["id"], "done")
+    g = by()["Анна Петрова"]
+    assert g["light"] == "green" and g["reasons"] == ["всё идёт по плану"] and g["progress"]["done"] >= 1
+    assert g["last_step"] and g["next_step"]["title"] and g["phase"] == "1-я неделя"
+
+    # сбой доставки → красный; пропуск → жёлтый; вопрос без ответа > суток → жёлтый
+    db.mark_step(a["id"], "welcome", "error")
+    assert by()["Анна Петрова"]["light"] == "red" and "не доставлено" in by()["Анна Петрова"]["reasons"][0]
+    db.mark_step(a["id"], "welcome", "skipped")
+    assert by()["Анна Петрова"]["light"] == "yellow" and "пропущено этапов: 1" in by()["Анна Петрова"]["reasons"]
+    db.mark_step(a["id"], "welcome", "done")
+    db.update_employee(a["id"], state={"pending": {"asked_at": time.time() - 2 * 86400}})
+    assert "вопрос без ответа больше суток" in by()["Анна Петрова"]["reasons"]
+    db.update_employee(a["id"], state={"pending": {"asked_at": time.time()}})
+    assert by()["Анна Петрова"]["light"] == "green"
+
+    # средний риск (один красный флаг) → жёлтый
+    make_emp(user="uc", name="Вера Орлова", site="GrPP", hire="2026-10-20")
+    add("uc", "Мне тяжело", "negative", -0.5, ["адаптация и задачи"], red=True)
+    v = by()["Вера Орлова"]
+    assert v["light"] == "yellow" and "средний риск ухода" in " ".join(v["reasons"])
+
+    # не подключённые к боту: серый заранее, жёлтый — если выход уже близко
+    make_emp(user=None, name="Далёкий Новичок", hire="2026-12-01")
+    make_emp(user=None, name="Опоздавший Новичок", hire="2026-10-23")
+    far, late = by()["Далёкий Новичок"], by()["Опоздавший Новичок"]
+    assert far["light"] == "grey" and far["reasons"] == ["ещё не подключён к боту"] and far["score"] is None
+    assert late["light"] == "yellow" and "не привязан к боту" in late["reasons"][0]
+    assert [x["light"] for x in insights.status(now=now)][-1] == "grey"                                              # серые — в конце
+
+    # фильтры и работа без аргумента «сейчас»
+    assert list(by(site="GTP")) == ["Борис Сидоров"] and list(by(manager="Иванов")) == ["Анна Петрова"]
+    assert insights.status(site="GTP")[0]["name"] == "Борис Сидоров"
+
+
+def test_stats_ignore_messages_without_sentiment():
+    """Нажатия кнопок, «/»-команды и короткие ответы опросов оценки не получают — в общую статистику не входят."""
+    seed()
+    before = db.analytics()
+    for uid, text in (("ua", "[кнопка] Да, жду не дождусь!"), ("ua", "/start"), ("ua", "9"), ("only_buttons", "[кнопка] На ТЫ")):
+        db.add_message(uid, "web", "user", text)
+    after = db.analytics()
+    assert after["user_messages"] == before["user_messages"] == 4 and after["users"] == before["users"] == 2   # «only_buttons» — не пользователь
+    assert sum(d["n"] for d in after["daily"]) == 4 and after["sentiments"] == before["sentiments"]
+    texts = [r["text"] for r in db.messages_drill()]
+    assert len(texts) == 4 and not {"/start", "9"} & set(texts) and not any(x.startswith("[кнопка]") for x in texts)
 
 
 def test_survey_comments():
@@ -211,6 +274,9 @@ def test_insights_api_endpoints():
     assert client.get("/api/analytics/drill?red_flag=true&day=&user_id=ub").json()
     assert len(client.get("/api/insights/stages?site=GrPP").json()) == 6
     assert client.get("/api/insights/funnel").json()[0]["id"] == "welcome"
+    st = client.get("/api/insights/status").json()
+    assert st[0]["name"] == "Борис Сидоров" and st[0]["light"] == "red" and {"phase", "reasons", "progress", "next_step"} <= st[0].keys()
+    assert [x["name"] for x in client.get("/api/insights/status?site=GrPP&manager=Иванов").json()] == ["Анна Петрова"]
     assert client.get("/api/insights/risk?manager=Смирнов").json()[0]["level"] == "high"
     db.add_answer(a["id"], "d3_survey", "q1", "scale", "5", "5", comment="Сложно")
     c = client.get("/api/insights/comments").json()
@@ -329,3 +395,51 @@ def test_topic_and_sentiment_filters_and_positive_counts_as_neutral():
 def err(r):
     assert r.status_code == 400
     return r.json()["detail"]
+
+
+# ---------- кэш и пакетные расчёты дашборда ----------
+def test_dashboard_calculations_are_cached_briefly_and_return_copies(monkeypatch):
+    monkeypatch.setenv("INSIGHTS_CACHE_TTL", "60")
+    insights.cache_clear()
+    make_emp(user="c1", name="Кэш Тестов")
+    calls, orig = [], db.risk_inputs
+    monkeypatch.setattr(db, "risk_inputs", lambda *a, **k: (calls.append(1), orig(*a, **k))[1])
+    first = insights.risk()
+    first[0]["score"] = 999                                   # правка результата не портит кэш
+    assert insights.risk()[0]["score"] != 999 and len(calls) == 1
+    insights.status()                                         # светофор берёт риск из того же кэша
+    assert len(calls) == 1
+    insights.cache_clear()
+    insights.risk()
+    assert len(calls) == 2
+    monkeypatch.setenv("INSIGHTS_CACHE_TTL", "0.05")          # через долю секунды расчёт повторяется
+    insights.cache_clear()
+    insights.risk()
+    time.sleep(0.1)
+    insights.risk()
+    assert len(calls) == 4
+    monkeypatch.setenv("INSIGHTS_CACHE_TTL", "0")             # 0 — кэш выключен
+    insights.risk()
+    insights.risk()
+    assert len(calls) == 6
+    insights.cache_clear()
+
+
+def test_step_statuses_in_one_query_and_risk_inputs_limits_messages_per_user():
+    a, b = make_emp(user="p1", name="Первый Новичок"), make_emp(user="p2", name="Второй Новичок")
+    db.mark_step(a["id"], "welcome", "done")
+    db.mark_step(b["id"], "welcome", "sent")
+    allst = db.step_statuses()
+    assert allst[a["id"]]["welcome"]["status"] == "done" and allst[b["id"]]["welcome"]["status"] == "sent"
+    assert list(db.step_statuses([a["id"]])) == [a["id"]] and db.step_statuses([]) == {}
+    for i in range(3):
+        add("p1", f"сообщение {i}", "neutral")
+    add("p2", "красный", "negative", -0.9, ["увольнение"], red=True)
+    old = db.MSGS_PER_USER
+    db.MSGS_PER_USER = 2                                      # лимит на пользователя: берутся самые свежие
+    try:
+        data = db.risk_inputs(["p1", "p2"], [a["id"], b["id"]])
+    finally:
+        db.MSGS_PER_USER = old
+    assert [r["sentiment"] for r in data["msgs"]["p1"]] == ["neutral", "neutral"] and data["msgs"]["p2"][0]["red_flag"] is True
+    assert data["msgs"]["p2"][0]["topics"] == ["увольнение"] and data["last"].keys() == {"p1", "p2"}

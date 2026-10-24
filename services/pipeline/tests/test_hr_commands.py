@@ -1,4 +1,4 @@
-"""Передача HR только по кнопке (с подтверждением), команды из панели управления, пост-обработка текста (род, «Вам»)."""
+"""Бесшовная передача HR (без подтверждения), команды из панели управления, пост-обработка текста (род, «Вам»)."""
 import hashlib
 import json
 
@@ -19,75 +19,87 @@ def labels(res, i=-1):
     return [b["text"] for row in (res["messages"][i]["buttons"] or []) for b in row]
 
 
-# ---------- «Передать HR» с подтверждением ----------
+# ---------- бесшовная эскалация: HR получает вопрос сразу, без подтверждения сотрудника ----------
 @respx.mock
-async def test_unanswered_question_offers_send_button_and_sends_only_on_click():
+async def test_unanswered_question_is_escalated_silently():
     llm_router(search=True)
     res = await bot.handle("g1", "web", text="Какой пароль от wifi?")
-    assert labels(res) == ["Передать HR", "Связаться с рекрутером"] and db.list_escalations() == []     # ничего не ушло
-    res = await bot.handle("g1", "web", payload="hr:send")
-    assert res["reply"].startswith("Передал!")
+    assert res["messages"] == [] and res["reply"] == "" and not res["grounded"]      # в чат — ничего
     esc = db.list_escalations()
     assert len(esc) == 1 and esc[0]["kind"] == "unanswered" and "Какой пароль от wifi?" in esc[0]["reason"]
-    assert (await bot.handle("g1", "web", payload="hr:send"))["reply"] == hrflow.NOTHING_REPLY      # повторно — нечего передавать
-    assert len(db.list_escalations()) == 1
+    assert [m["role"] for m in db.history("g1")] == ["user"]                         # бот ничего не отвечал
+    await bot.handle("g1", "web", text="А пароль от принтера?")                      # второй вопрос — в то же обращение, а не новое
+    esc = db.list_escalations()
+    assert len(esc) == 1 and esc[0]["repeats"] == 2 and "пароль от wifi" in esc[0]["reason"] and "от принтера" in esc[0]["reason"]
 
 
 @respx.mock
-async def test_agent_proposal_needs_confirmation_and_can_be_cancelled():
+async def test_technical_failure_is_not_silent_escalation():
+    llm_router(search=True)
+    respx.post(ING).mock(return_value=httpx.Response(500, text="boom"))              # поиск недоступен — это не «не знаю»
+    res = await bot.handle("g1b", "web", text="Какой пароль от wifi?")
+    assert res["reply"] == agent.FALLBACK and db.list_escalations() == []
+    respx.post(GW).mock(return_value=httpx.Response(500, text="x"))                  # модель недоступна
+    res = await bot.handle("g1b", "web", text="Когда обед?")
+    assert res["reply"] == agent.FALLBACK and db.list_escalations() == []
+
+
+@respx.mock
+async def test_agent_escalation_is_immediate_and_reply_has_no_buttons():
     def side(req):
         body = json.loads(req.content)
         if body.get("response_format"):
             return llm_reply(json.dumps({"sentiment": "neutral", "score": 0, "topics": ["зарплата и выплаты"], "red_flag": False}))
         if not any(m["role"] == "tool" for m in body["messages"]):
             return llm_reply(tool_calls=[tool_call("escalate_to_hr", {"reason": "Вопрос о зарплате"})])
-        return llm_reply("Это вопрос для HR. Если хочешь, передам его коллегам — нажми «Передать HR».")
+        return llm_reply("Это вопрос для HR — я передал его коллегам, они скоро свяжутся.")
     respx.post(GW).mock(side_effect=side)
     res = await bot.handle("g2", "web", text="Сколько мне заплатят?")
-    assert labels(res) == ["Передать HR", "Не передавать"] and not res["escalated"] and db.list_escalations() == []
-    res = await bot.handle("g2", "web", payload="hr:cancel")
-    assert res["reply"] == hrflow.CANCEL_REPLY and db.list_escalations() == []
-    assert (await bot.handle("g2", "web", payload="hr:send"))["reply"] == hrflow.NOTHING_REPLY
-    await bot.handle("g2", "web", text="Сколько мне заплатят?")
-    await bot.handle("g2", "web", payload="hr:send")
-    esc = db.list_escalations()[0]
-    assert esc["kind"] == "agent" and "Вопрос о зарплате" in esc["reason"] and "Сколько мне заплатят?" in esc["reason"]
+    assert res["reply"].startswith("Это вопрос для HR") and res["messages"][0]["buttons"] is None
+    esc = db.list_escalations()
+    assert len(esc) == 1 and esc[0]["kind"] == "agent" and "Вопрос о зарплате" in esc[0]["reason"] and "Сколько мне заплатят?" in esc[0]["reason"]
+    assert (await bot.handle("g2", "web", payload="hr:send"))["reply"] == "Этот вопрос уже пройден 🙂"   # старая кнопка согласия больше не действует
 
 
 @respx.mock
-async def test_forward_compose_shows_text_and_asks_confirmation_even_for_new_question():
+async def test_forward_compose_sends_text_immediately_and_can_be_cancelled():
     llm_router()
     res = await bot.handle("g3", "web", payload="hr:forward")             # работает и без привязки к сценарию
-    assert "подтверждения" in res["reply"]
-    assert labels(res) == ["Не передавать"]
-    res = await bot.handle("g3", "web", text="Во сколько начинается рабочий день?")   # дефект №4 отчёта: это мог быть новый вопрос
-    assert res["reply"].startswith("Вот что я передам HR:\n«Во сколько начинается рабочий день?»") and labels(res) == ["Передать HR", "Не передавать"]
-    assert db.list_escalations() == []
+    assert "сразу передам" in res["reply"] and labels(res) == ["Не передавать"] and hrflow.awaiting("g3")
     res = await bot.handle("g3", "web", payload="hr:cancel")
-    assert db.list_escalations() == [] and res["reply"] == hrflow.CANCEL_REPLY
+    assert res["reply"] == hrflow.CANCEL_REPLY and db.list_escalations() == [] and not hrflow.awaiting("g3")
     await bot.handle("g3", "web", payload="hr:forward")
-    await bot.handle("g3", "web", text="Не могу войти в почту")
-    await bot.handle("g3", "web", payload="hr:send")
-    assert db.list_escalations()[0]["kind"] == "forward" and "почту" in db.list_escalations()[0]["reason"]
+    res = await bot.handle("g3", "web", text="Не могу войти в почту")
+    assert res["reply"] == hrflow.FORWARD_REPLY and labels(res) == [] and not hrflow.awaiting("g3")
+    esc = db.list_escalations()
+    assert len(esc) == 1 and esc[0]["kind"] == "forward" and "почту" in esc[0]["reason"]
 
 
 @respx.mock
-async def test_command_while_waiting_stops_waiting_and_hr_command_flow():
+async def test_command_while_waiting_stops_waiting_and_hr_command_escalates_at_once():
     llm_router(kb_text="Ответ из базы")
     await bot.handle("g4", "web", payload="hr:forward")
     await bot.handle("g4", "web", text="/help")                           # команда отменяет режим «жду текст обращения»
     res = await bot.handle("g4", "web", text="Когда обед?")
     assert res["reply"] == "Ответ из базы" and db.list_escalations() == []
-    res = await bot.handle("g4", "web", text="/HR")
-    assert labels(res) == ["Передать HR", "Не передавать"] and hrflow.awaiting("g4")
-    res = await bot.handle("g4", "web", text="Нужна справка о доходах")  # описание вместо пустого «просто свяжитесь»
-    assert "Нужна справка о доходах" in res["reply"] and not db.list_escalations()
-    await bot.handle("g4", "web", payload="hr:send")
-    assert db.list_escalations()[0]["kind"] == "forward"
-    await bot.handle("g4", "web", text="/HR")
-    await bot.handle("g4", "web", payload="hr:send")                      # без описания — просьба связаться
-    assert db.list_escalations()[0]["kind"] == "command"
+    res = await bot.handle("g4", "web", text="/HR")                       # обращение создаётся сразу, без вопросов и кнопок
+    assert res["reply"].startswith("Передал твой запрос") and labels(res) == [] and not hrflow.awaiting("g4")
+    esc = db.list_escalations()
+    assert len(esc) == 1 and esc[0]["kind"] == "command"
+    res = await bot.handle("g4", "web", text="Нужна справка о доходах")  # дальше — обычный диалог, HR видит его целиком
+    assert res["reply"] == "Ответ из базы" and len(db.list_escalations()) == 1
     hrflow.stop_waiting("nobody")                                         # безопасно для неизвестного пользователя
+
+
+def test_old_hr_command_text_is_migrated_but_edited_text_is_kept():
+    from app import commands
+    commands.ensure()
+    db.save_command("hr", reply=commands.OLD_HR_REPLY)                    # база с прежним текстом (передача с подтверждением)
+    commands.ensure()
+    assert db.get_command("hr")["reply"].startswith("Передал твой запрос")
+    db.save_command("hr", reply="Свой текст HR")
+    commands.ensure()
+    assert db.get_command("hr")["reply"] == "Свой текст HR"
 
 
 @respx.mock
@@ -99,19 +111,17 @@ async def test_contact_button_is_immediate_for_any_user():
 
 
 @respx.mock
-async def test_hr_flow_in_max_channel_with_callbacks(monkeypatch):
+async def test_hr_flow_in_max_channel_is_silent_for_unanswered(monkeypatch):
     llm_router(search=True)
     monkeypatch.setenv("MAX_BOT_TOKEN", "tok")
     client.post("/api/mode", json={"mode": "max"})
     sent = respx.post("http://max/messages").mock(return_value=httpx.Response(200, json={}))
-    respx.post("http://max/answers").mock(return_value=httpx.Response(200, json={}))
     upd = {"update_type": "message_created", "message": {"sender": {"user_id": 7, "name": "Ира"}, "recipient": {"chat_type": "dialog"},
                                                           "body": {"text": "Какой пароль от wifi?"}}}
     anon.post("/max/webhook", json=upd)
-    kb = json.loads(sent.calls.last.request.content)["attachments"][0]["payload"]["buttons"]
-    assert [b["text"] for r in kb for b in r] == ["Передать HR", "Связаться с рекрутером"] and db.list_escalations() == []
-    anon.post("/max/webhook", json={"update_type": "message_callback", "callback": {"callback_id": "c", "payload": "hr:send", "user": {"user_id": 7}}})
+    assert not sent.called                                                # в МАКС сотруднику ничего не отправлено
     assert db.list_escalations()[0]["kind"] == "unanswered"
+    assert db.list_escalations()[0]["channel"] == "max"
 
 
 # ---------- команды из панели управления ----------
@@ -233,6 +243,7 @@ async def test_agent_reply_is_fixed_to_masculine_and_formal_rewrite_capitalised(
     assert await style.to_formal("кэш") == "1. Вам кэш"
 
 
-def test_persona_prompt_forbids_guessing_user_gender_and_requires_confirmation():
+def test_persona_prompt_forbids_guessing_user_gender_and_describes_seamless_handoff():
     p = style.persona_prompt({"name": "Анна", "site": "GrPP", "hire_date": "2026-11-02", "form": "ty"})
-    assert "НЕ вызывай escalate_to_hr" in p and "если кнопка появилась" in p and "НЕ угадывай по имени" in p and "Никогда: «я передала»" in p and "кнопкой «Передать HR»" in p and "НЕ пиши «я уже передал»" in p
+    assert "НЕ вызывай escalate_to_hr" in p and "НЕ угадывай по имени" in p and "Никогда: «я передала»" in p
+    assert "без кнопок и подтверждений" in p and "ничего не покажет человеку" in p and "нажми «Передать HR»" not in p

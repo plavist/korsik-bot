@@ -1,5 +1,4 @@
 """Извлечение текста: текстовый слой -> иначе OCR (Tesseract)."""
-import io
 import os
 import subprocess
 import tempfile
@@ -21,7 +20,7 @@ def ocr_image_bytes(data: bytes) -> str:
 def _tesseract(path: str) -> str:
     r = subprocess.run(
         ["tesseract", path, "-", "-l", config.ocr_lang(), "--psm", "3"],
-        capture_output=True, text=True, timeout=180,
+        check=False, capture_output=True, text=True, timeout=180,
     )
     if r.returncode != 0:
         raise RuntimeError(f"tesseract failed: {r.stderr[:300]}")
@@ -29,7 +28,7 @@ def _tesseract(path: str) -> str:
 
 
 def _pdf_pages_count(path: str) -> int:
-    r = subprocess.run(["pdfinfo", path], capture_output=True, text=True, timeout=60)
+    r = subprocess.run(["pdfinfo", path], check=False, capture_output=True, text=True, timeout=60)
     for line in r.stdout.splitlines():
         if line.startswith("Pages:"):
             return int(line.split()[1])
@@ -39,7 +38,7 @@ def _pdf_pages_count(path: str) -> int:
 def _pdf_text_layer(path: str, page: int) -> str:
     r = subprocess.run(
         ["pdftotext", "-layout", "-f", str(page), "-l", str(page), path, "-"],
-        capture_output=True, text=True, timeout=60,
+        check=False, capture_output=True, text=True, timeout=60,
     )
     return r.stdout.strip()
 

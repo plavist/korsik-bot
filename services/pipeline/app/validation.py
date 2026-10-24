@@ -49,7 +49,7 @@ def iso_date(v: str | None, field: str) -> date | None:
     try:
         return date.fromisoformat(v)
     except ValueError:
-        raise ValueError(f"{field}: дата в формате ГГГГ-ММ-ДД")
+        raise ValueError(f"{field}: дата в формате ГГГГ-ММ-ДД") from None
 
 
 def employee_dates(hire: date | None, end: date | None) -> None:

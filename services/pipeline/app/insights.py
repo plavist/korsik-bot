@@ -1,6 +1,10 @@
 """Аналитика для HR и руководителей: этапы онбординга, воронка, индекс риска ухода, недельный дайджест настроений,
 напоминания руководителям подразделений о личных встречах."""
+import copy
+import functools
+import inspect
 import json
+import os
 import re
 import time
 from datetime import date, datetime, timedelta
@@ -12,15 +16,47 @@ PHASES = ["До выхода", "1-я неделя", "2–4 неделя", "2-й 
 LEVELS = (("high", 50), ("medium", 25), ("low", 0))
 
 
+_cache: dict = {}
+
+
+def cached(fn):
+    """Короткий кэш тяжёлых расчётов дашборда (INSIGHTS_CACHE_TTL секунд, по умолчанию 15; 0 — выключен).
+    Страница аналитики запрашивает несколько блоков сразу, и каждый пересчитывал бы одно и то же."""
+    sig = inspect.signature(fn)
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        ttl = float(os.getenv("INSIGHTS_CACHE_TTL", "15"))
+        if ttl <= 0:
+            return fn(*args, **kwargs)
+        bound = sig.bind(*args, **kwargs)
+        bound.apply_defaults()                                   # risk() и risk(None, None) — один и тот же запрос
+        key = (fn.__name__, tuple(bound.arguments.items()))
+        hit = _cache.get(key)
+        if hit and time.time() - hit[0] < ttl:
+            return copy.deepcopy(hit[1])
+        value = fn(*args, **kwargs)
+        _cache[key] = (time.time(), value)
+        return copy.deepcopy(value)
+    wrapper.__wrapped__ = fn
+    return wrapper
+
+
+def cache_clear() -> None:
+    _cache.clear()
+
+
 def _employees(site=None, manager=None) -> list[dict]:
     return [e for e in db.list_employees() if e["active"] and (not site or e["site"] == site)
             and (not manager or e.get("manager") == manager)]
 
 
-def phase(emp: dict, today: date | None = None) -> str:
+def phase(emp: dict, today: date | None = None, status: dict | None = None) -> str:
+    """status — статусы этапов сотрудника, если они уже загружены (иначе читаются из базы)."""
     today = today or engine.now_local().date()
     d = sc.dates(emp)
-    if today > d["end"] or db.step_status(emp["id"]).get("end_probation", {}).get("status") == "done":
+    status = db.step_status(emp["id"]) if status is None else status
+    if today > d["end"] or status.get("end_probation", {}).get("status") == "done":
         return PHASES[5]
     days = (today - d["hire"]).days
     if days < 0:
@@ -28,23 +64,28 @@ def phase(emp: dict, today: date | None = None) -> str:
     return PHASES[1] if days <= 7 else PHASES[2] if days <= 30 else PHASES[3] if days <= 60 else PHASES[4]
 
 
+@cached
 def stages(site=None, manager=None) -> list[dict]:
     """Сколько новичков на каком этапе онбординга (+ кто именно — для детализации по клику)."""
     emps = _employees(site, manager)
+    statuses = db.step_statuses([e["id"] for e in emps])
+    phases = {e["id"]: phase(e, status=statuses.get(e["id"], {})) for e in emps}
     return [{"stage": p, "employees": [{"id": e["id"], "name": e["name"], "site": e["site"], "manager": e.get("manager")}
-                                       for e in emps if phase(e) == p]} for p in PHASES]
+                                       for e in emps if phases[e["id"]] == p]} for p in PHASES]
 
 
+@cached
 def funnel(site=None, manager=None) -> list[dict]:
     """Прохождение этапов сценария: сколько привязанных новичков получили/прошли каждый этап."""
     emps = [e for e in _employees(site, manager) if e["user_id"]]
+    statuses = db.step_statuses([e["id"] for e in emps])
     out = []
     for step in sc.STEPS:
         sent = done = 0
         for e in emps:
             if not sc.applies(step, e):
                 continue
-            st = db.step_status(e["id"]).get(step["id"], {}).get("status")
+            st = statuses.get(e["id"], {}).get(step["id"], {}).get("status")
             sent += st in ("sent", "done")
             done += st == "done"
         applicable = sum(1 for e in emps if sc.applies(step, e))
@@ -62,48 +103,107 @@ def survey_comments(emp_id: int | None = None, days: int | None = None) -> list[
             if a["created_at"] >= since and ((a["qtype"] == "text" and a["value"].strip()) or (a["comment"] or "").strip())]
 
 
+def _risk_score(e: dict, rows: list[dict], scale: list[str], open_esc: int, silent_days: float | None, ph: str) -> tuple[int, list[str]]:
+    """Баллы и причины индекса риска одного сотрудника (веса — в README и документации, раздел «Индекс риска ухода»)."""
+    factors, score = [], 0
+
+    def add(points: int, text: str) -> None:
+        nonlocal score
+        score += points
+        factors.append(text)
+
+    flags = sum(r["red_flag"] for r in rows)
+    if flags:
+        add(min(50, 25 * flags), f"красные флаги в сообщениях: {flags}")
+    neg = sum(r["sentiment"] == "negative" for r in rows)
+    if len(rows) >= 2 and neg / len(rows) >= 0.4:
+        add(15, f"негативных сообщений: {neg} из {len(rows)}")
+    avg = sum(r["sentiment_score"] or 0 for r in rows) / len(rows) if rows else 0
+    if rows and avg < -0.3:
+        add(10, f"средняя тональность {avg:.2f}")
+    if any("увольнение" in r["topics"] for r in rows):
+        add(30, "упоминает увольнение")
+    low = [v for v in scale if v.isdigit() and int(v) < 8]
+    if low:
+        add(min(24, 8 * len(low)) + (10 if any(int(v) <= 4 for v in low) else 0), "низкие оценки в опросах: " + ", ".join(low[:5]))
+    if open_esc:
+        add(min(20, 10 * open_esc), f"открытых обращений: {open_esc}")
+    if silent_days is not None and silent_days > 5 and ph not in (PHASES[0], PHASES[5]):
+        add(10, "молчит больше 5 дней")
+    return min(100, score), factors
+
+
+@cached
 def risk(site=None, manager=None, days: int | None = None) -> list[dict]:
-    """Прогноз риска ухода по ранним сигналам (0–100): красные флаги, негатив, низкие оценки, открытые обращения, тишина."""
-    out = []
-    for e in _employees(site, manager):
-        if not e["user_id"]:
-            continue
-        rows = db.messages_drill(days=days, user_id=e["user_id"], limit=500)
-        factors, score = [], 0
-        flags = sum(r["red_flag"] for r in rows)
-        if flags:
-            score += min(50, 25 * flags)
-            factors.append(f"красные флаги в сообщениях: {flags}")
-        scored = [r for r in rows if r["sentiment"]]
-        neg = sum(r["sentiment"] == "negative" for r in scored)
-        if len(scored) >= 2 and neg / len(scored) >= 0.4:
-            score += 15
-            factors.append(f"негативных сообщений: {neg} из {len(scored)}")
-        avg = sum(r["sentiment_score"] or 0 for r in scored) / len(scored) if scored else 0
-        if scored and avg < -0.3:
-            score += 10
-            factors.append(f"средняя тональность {avg:.2f}")
-        if any("увольнение" in r["topics"] for r in rows):
-            score += 30
-            factors.append("упоминает увольнение")
-        low = [a for a in db.list_answers(e["id"]) if a["qtype"] == "scale" and a["value"].isdigit() and int(a["value"]) < 8]
-        if low:
-            score += min(24, 8 * len(low)) + (10 if any(int(a["value"]) <= 4 for a in low) else 0)
-            factors.append("низкие оценки в опросах: " + ", ".join(a["value"] for a in low[:5]))
-        open_esc = [x for x in db.list_escalations() if x["user_id"] == e["user_id"] and x["status"] != "resolved"
-                    and x["kind"] in ("survey", "sentiment", "contact", "agent", "intent", "forward")]
-        if open_esc:
-            score += min(20, 10 * len(open_esc))
-            factors.append(f"открытых обращений: {len(open_esc)}")
-        last = max((h["created_at"] for h in db.history(e["user_id"], 20)), default=None)
-        if last and time.time() - last > 5 * 86400 and phase(e) not in (PHASES[0], PHASES[5]):
-            score += 10
-            factors.append("молчит больше 5 дней")
-        score = min(100, score)
+    """Прогноз риска ухода по ранним сигналам (0–100): красные флаги, негатив, низкие оценки, открытые обращения, тишина.
+    Все данные загружаются пакетно (см. db.risk_inputs), поэтому время растёт с числом сотрудников почти незаметно."""
+    emps = [e for e in _employees(site, manager) if e["user_id"]]
+    data = db.risk_inputs([e["user_id"] for e in emps], [e["id"] for e in emps], days)
+    statuses = db.step_statuses([e["id"] for e in emps])
+    now, out = time.time(), []
+    for e in emps:
+        ph = phase(e, status=statuses.get(e["id"], {}))
+        last = data["last"].get(e["user_id"])
+        score, factors = _risk_score(e, data["msgs"].get(e["user_id"], []), data["scale"].get(e["id"], []),
+                                     data["open_esc"].get(e["user_id"], 0), (now - last) / 86400 if last else None, ph)
         level = next(name for name, lo in LEVELS if score >= lo)
         out.append({"id": e["id"], "name": e["name"], "site": e["site"], "manager": e.get("manager"), "user_id": e["user_id"],
-                    "phase": phase(e), "score": score, "level": level, "factors": factors})
+                    "phase": ph, "score": score, "level": level, "factors": factors})
     return sorted(out, key=lambda r: -r["score"])
+
+
+# ---------- светофор «Статус адаптации» по каждому новичку ----------
+LIGHTS = ("red", "yellow", "green", "grey")
+STALE_SURVEY = 24 * 3600  # опрос без ответа дольше суток — повод посмотреть
+
+
+def _light(e: dict, tl: list[dict], r: dict | None, now: datetime) -> tuple[str, list[str]]:
+    """Цвет светофора и причины для одного новичка (правила — BR-16 в документации)."""
+    by = {s: [t for t in tl if t["status"] == s] for s in ("error", "skipped", "due", "waiting_recruiter")}
+    if not e["user_id"]:                      # ещё не подключён: серый, а в день выхода и накануне — жёлтый
+        if sc.dates(e)["hire"] <= now.date() + timedelta(days=1):
+            return "yellow", [f"не привязан к боту, хотя выход {e['hire_date']}"]
+        return "grey", ["ещё не подключён к боту"]
+    red, yellow = [], []
+    if r and r["level"] == "high":
+        red.append(f"высокий риск ухода ({r['score']}/100): " + "; ".join(r["factors"][:2]))
+    elif r and r["level"] == "medium":
+        yellow.append(f"средний риск ухода ({r['score']}/100): " + "; ".join(r["factors"][:2]))
+    if by["error"]:
+        red.append("не доставлено: " + ", ".join(t["title"] for t in by["error"][:2]))
+    if by["skipped"]:
+        yellow.append(f"пропущено этапов: {len(by['skipped'])}")
+    late = by["due"] + [t for t in by["waiting_recruiter"] if t["due"] and t["due"] <= now.isoformat()]
+    if late:
+        yellow.append("этап ждёт отправки: " + late[0]["title"] + ("" if len(late) == 1 else f" (+{len(late) - 1})"))
+    p = e["state"].get("pending")
+    if p and time.time() - p["asked_at"] > STALE_SURVEY:
+        yellow.append("вопрос без ответа больше суток")
+    return ("red" if red else "yellow" if yellow else "green"), (red + yellow) or ["всё идёт по плану"]
+
+
+@cached
+def status(site=None, manager=None, now: datetime | None = None) -> list[dict]:
+    """Светофор по каждому активному новичку: красный — нужна реакция, жёлтый — внимание, зелёный — всё идёт по плану,
+    серый — ещё не подключён к боту. Учитывает индекс риска, сбои и пропуски этапов, неотвеченные опросы."""
+    now = now or engine.now_local()
+    levels = {r["id"]: r for r in risk(site, manager)}
+    emps = _employees(site, manager)
+    statuses = db.step_statuses([e["id"] for e in emps])
+    out = []
+    for e in emps:
+        st = statuses.get(e["id"], {})
+        tl = engine.timeline(e, now, st)
+        r = levels.get(e["id"])
+        light, reasons = _light(e, tl, r, now)
+        passed = [t for t in tl if t["status"] in ("done", "sent")]
+        upcoming = [t for t in tl if t["status"] in ("scheduled", "due", "waiting_recruiter")]
+        out.append({"id": e["id"], "name": e["name"], "site": e["site"], "manager": e.get("manager"), "user_id": e["user_id"],
+                    "phase": phase(e, now.date(), st), "light": light, "reasons": reasons, "score": r["score"] if r else None,
+                    "progress": {"done": sum(t["status"] in ("done", "n/a") for t in tl), "total": len(tl)},
+                    "last_step": passed[-1]["title"] if passed else None,
+                    "next_step": {"title": upcoming[0]["title"], "due": upcoming[0]["due"]} if upcoming else None})
+    return sorted(out, key=lambda x: (LIGHTS.index(x["light"]), -(x["score"] or 0), x["name"]))
 
 
 # ---------- недельный дайджест «Настроения в коллективе новичков» ----------

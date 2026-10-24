@@ -1,10 +1,12 @@
 import asyncio
+import contextlib
 import hmac
+import json
 import re
 from contextlib import asynccontextmanager
 from datetime import date, datetime
-from pathlib import Path
 
+import httpx
 from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -12,7 +14,7 @@ from fastapi.exceptions import RequestValidationError
 
 from . import sentiment as sentiment_mod
 from . import validation as V
-from . import assets, bot, channels, commands, config, db, engine, insights, max_poller, scenario_edit
+from . import agent, assets, bot, channels, commands, config, db, engine, insights, locks, max_poller, scenario_edit
 from . import scenario as sc
 
 
@@ -24,8 +26,9 @@ async def lifespan(app: FastAPI):
     poller = asyncio.create_task(max_poller.run(process_max))
     registrar = asyncio.create_task(register_commands_on_start())
     scheduler = asyncio.create_task(scheduler_loop())
+    recovery = asyncio.create_task(recover_inbox())
     yield
-    for t in (poller, registrar, scheduler):
+    for t in (poller, registrar, scheduler, recovery):
         t.cancel()
 
 
@@ -224,19 +227,58 @@ async def scheduler_loop(interval: float = 30.0) -> None:
         await asyncio.sleep(interval)
 
 
-async def process_max(parsed: dict) -> None:
-    """Событие MAX (из polling или webhook) → бот → ответ пользователю в MAX."""
+SEND_ATTEMPTS = 3          # попыток отправить сообщение в МАКС
+EVENT_ATTEMPTS = 3         # сколько раз пробуем довести событие, оставшееся «в работе» после перезапуска
+
+
+async def _send_with_retry(user_id: str, m: dict) -> None:
+    """Сеть и МАКС иногда отвечают ошибкой — повторяем с растущей паузой, прежде чем сдаться."""
+    for attempt in range(SEND_ATTEMPTS):
+        try:
+            await channels.send_max(user_id, m["text"], m.get("buttons"), md=m.get("md", False), image=m.get("image"))
+            return
+        except Exception:  # noqa: BLE001
+            if attempt == SEND_ATTEMPTS - 1:
+                raise
+            await asyncio.sleep(config.send_retry_delay() * (attempt + 1))
+
+
+async def run_event(event_id: int, parsed: dict) -> None:
+    """Обработка события МАКС. Успех — запись «в работе» удаляется; сбой — запись остаётся со статусом failed (видно в статусе
+    канала), а сотрудник получает извинение вместо тишины."""
     try:
         res = await bot.handle(parsed["user_id"], "max", text=parsed.get("text"), payload=parsed.get("payload"),
                                name=parsed.get("name"))
         for m in res["messages"]:
-            await channels.send_max(parsed["user_id"], m["text"], m.get("buttons"), md=m.get("md", False), image=m.get("image"))
+            await _send_with_retry(parsed["user_id"], m)
         if parsed.get("callback_id"):
             await channels.answer_callback(parsed["callback_id"])
         await channels.delete_pressed_message(parsed.get("message_id"))
         max_poller.state["processed"] += 1
+        db.inbox_done(event_id)
     except Exception as e:  # noqa: BLE001 — сбой одного события не должен останавливать канал
         max_poller.state["last_error"] = f"обработка/отправка: {e}"[:300]
+        db.inbox_fail(event_id, str(e))
+        with contextlib.suppress(Exception):  # МАКС недоступен: извиниться не получилось, событие осталось в списке сбоев
+            await channels.send_max(parsed["user_id"], agent.FALLBACK)
+
+
+async def process_max(parsed: dict) -> None:
+    """Событие МАКС (из polling или webhook) → бот → ответ пользователю в МАКС. Событие записывается заранее: при остановке
+    сервиса посреди обработки оно будет доведено после запуска (recover_inbox)."""
+    await run_event(db.inbox_add(parsed["user_id"], json.dumps(parsed, ensure_ascii=False)), parsed)
+
+
+async def recover_inbox() -> int:
+    """После запуска доводит события, прерванные остановкой сервиса (не больше EVENT_ATTEMPTS попыток на событие)."""
+    done = 0
+    for row in db.inbox_pending():
+        if db.inbox_retry(row["id"]) > EVENT_ATTEMPTS:
+            db.inbox_fail(row["id"], "прервано остановкой сервиса, число попыток исчерпано")
+            continue
+        await run_event(row["id"], json.loads(row["payload"]))
+        done += 1
+    return done
 
 
 # ---------- публичные маршруты ----------
@@ -258,7 +300,9 @@ async def asset_file(fname: str):
 async def max_webhook(request: Request, background: BackgroundTasks,
                       x_max_bot_api_secret: str | None = Header(default=None)):
     secret = config.max_webhook_secret()
-    if secret and not hmac.compare_digest(secret, x_max_bot_api_secret or ""):
+    if not secret:  # без секрета любой мог бы прислать поддельное событие «от имени сотрудника» — вебхук выключен
+        raise HTTPException(503, "webhook disabled: set MAX_WEBHOOK_SECRET")
+    if not hmac.compare_digest(secret, x_max_bot_api_secret or ""):
         raise HTTPException(401, "bad secret")
     if not channels.max_enabled():
         return {"ok": True, "ignored": "max channel disabled"}
@@ -273,8 +317,8 @@ async def max_webhook(request: Request, background: BackgroundTasks,
 
 @app.get("/api/max/status", dependencies=ADMIN)
 async def max_status():
-    out = {"configured": bool(config.max_token()), "transport": config.max_transport(),
-           "api": config.max_api(), "poller": max_poller.state, "bot": None, "subscriptions": None, "error": None}
+    out = {"configured": bool(config.max_token()), "transport": config.max_transport(), "api": config.max_api(),
+           "poller": max_poller.state, "inbox": db.inbox_counts(), "bot": None, "subscriptions": None, "error": None}
     if not out["configured"]:
         return out
     try:
@@ -292,9 +336,9 @@ async def max_status():
 
 @app.post("/api/max/subscribe", dependencies=ADMIN)
 async def max_subscribe(body: SubscribeIn):
-    payload = {"url": body.url, "update_types": ["message_created", "bot_started"]}
-    if config.max_webhook_secret():
-        payload["secret"] = config.max_webhook_secret()
+    if not config.max_webhook_secret():
+        raise HTTPException(400, "Задайте MAX_WEBHOOK_SECRET в .env: без секрета вебхук не принимается")
+    payload = {"url": body.url, "update_types": ["message_created", "bot_started"], "secret": config.max_webhook_secret()}
     r = await channels.max_request("POST", "/subscriptions", json=payload)
     return {"status": r.status_code, "body": r.json() if r.content else None}
 
@@ -313,7 +357,7 @@ async def max_commands():
     try:
         return {"ok": True, "response": await channels.register_commands()}
     except Exception as e:  # noqa: BLE001
-        raise HTTPException(502, str(e)[:300])
+        raise HTTPException(502, str(e)[:300]) from None
 
 
 async def _publish_commands() -> dict:
@@ -339,7 +383,7 @@ async def create_bot_command(body: CommandIn):
     try:
         fields = commands.validate(body.model_dump(exclude={"name"}), name, creating=True)
     except ValueError as e:
-        raise HTTPException(400, str(e))
+        raise HTTPException(400, str(e)) from None
     db.save_command(name, **fields, builtin=False, sort=100 + len(db.list_commands()))
     return {"command": db.get_command(name), **await _publish_commands()}
 
@@ -351,7 +395,7 @@ async def update_bot_command(name: str, body: CommandIn):
     try:
         fields = commands.validate(body.model_dump(exclude={"name", "kind"}, exclude_none=True), name.lower(), creating=False)
     except ValueError as e:
-        raise HTTPException(400, str(e))
+        raise HTTPException(400, str(e)) from None
     db.save_command(name.lower(), **fields)
     return {"command": db.get_command(name.lower()), **await _publish_commands()}
 
@@ -401,6 +445,19 @@ class Flt:  # общие фильтры страницы аналитики (п�
         self.days, self.site, self.manager = _days(days), site or None, manager or None
 
 
+@app.get("/api/usage", dependencies=ADMIN)
+async def llm_usage(days: int = Query(30, ge=1, le=3650)):
+    """Расход токенов и стоимость модели за период (учёт ведёт llm-gateway)."""
+    try:
+        async with httpx.AsyncClient(timeout=10) as c:
+            r = await c.get(f"{config.gateway_url()}/usage", params={"days": days})
+    except httpx.HTTPError as e:
+        raise HTTPException(502, f"llm-gateway недоступен: {e}") from None
+    if r.status_code != 200:
+        raise HTTPException(502, f"llm-gateway ответил {r.status_code}")
+    return r.json()
+
+
 @app.get("/api/analytics", dependencies=ADMIN)
 async def analytics(f: Flt = Depends()):
     return db.analytics(f.days, f.site, f.manager, f.topic, f.sentiment)
@@ -414,6 +471,11 @@ async def analytics_drill(f: Flt = Depends(), day: str | None = Query(None, patt
 @app.get("/api/insights/stages", dependencies=ADMIN)
 async def insights_stages(f: Flt = Depends()):
     return insights.stages(f.site, f.manager)
+
+
+@app.get("/api/insights/status", dependencies=ADMIN)
+async def insights_status(f: Flt = Depends()):
+    return insights.status(f.site, f.manager)
 
 
 @app.get("/api/insights/funnel", dependencies=ADMIN)
@@ -545,7 +607,7 @@ def _valid_date(v: str | None) -> str | None:
     try:
         return date.fromisoformat(v).isoformat()
     except ValueError:
-        raise HTTPException(400, f"неверная дата: {v} (ГГГГ-ММ-ДД)")
+        raise HTTPException(400, f"неверная дата: {v} (ГГГГ-ММ-ДД)") from None
 
 
 async def _emp_view(emp: dict, detail: bool = False) -> dict:
@@ -573,7 +635,7 @@ async def _deliver_or_502(emp: dict, msgs: list[dict]) -> dict:
     try:
         await deliver(emp, msgs)
     except Exception as e:  # noqa: BLE001
-        raise HTTPException(502, f"сообщения сохранены, но не доставлены: {e}"[:300])
+        raise HTTPException(502, f"сообщения сохранены, но не доставлены: {e}"[:300]) from None
     return {"ok": True, "sent": len(msgs)}
 
 
@@ -616,7 +678,7 @@ async def patch_employee(emp_id: int, body: EmployeePatch):
         V.employee_dates(V.iso_date(fields.get("hire_date", emp["hire_date"]), "дата выхода"),
                          V.iso_date(fields["probation_end"] if "probation_end" in fields else emp["probation_end"], "конец испытательного срока"))
     except ValueError as e:
-        raise HTTPException(400, str(e))
+        raise HTTPException(400, str(e)) from None
     if fields:
         db.update_employee(emp["id"], **fields)
     return await _emp_view(_get_emp(emp_id), detail=True)
@@ -634,7 +696,8 @@ async def bind_employee(emp_id: int, body: BindIn):
     emp, user = _get_emp(emp_id), db.get_user(body.user_id)
     if not user:
         raise HTTPException(404, "user not found")
-    msgs = await engine.bind(emp, user["user_id"], user["channel"])
+    async with locks.user_lock(user["user_id"]):
+        msgs = await engine.bind(emp, user["user_id"], user["channel"])
     return await _deliver_or_502(emp, msgs)
 
 
@@ -687,7 +750,7 @@ async def scheduler_tick(body: TickIn):
     try:
         now = datetime.fromisoformat(body.now) if body.now else None
     except ValueError:
-        raise HTTPException(400, f"неверные дата и время: {body.now} (ГГГГ-ММ-ДДTЧЧ:ММ)")
+        raise HTTPException(400, f"неверные дата и время: {body.now} (ГГГГ-ММ-ДДTЧЧ:ММ)") from None
     return {"sent": await engine.tick(deliver, now)}
 
 
@@ -713,9 +776,9 @@ def _edit(fn, *a, **kw):
     try:
         return fn(*a, **kw)
     except KeyError:
-        raise HTTPException(404, "этап или сообщение не найдены")
+        raise HTTPException(404, "этап или сообщение не найдены") from None
     except ValueError as e:
-        raise HTTPException(400, str(e))
+        raise HTTPException(400, str(e)) from None
 
 
 @app.get("/api/scenario", dependencies=ADMIN)
@@ -907,7 +970,7 @@ async def upload_scenario_image(request: Request, name: str = Query("", max_leng
     try:
         return {"file": assets.save_upload(await request.body(), name)}
     except ValueError as e:
-        raise HTTPException(400, str(e))
+        raise HTTPException(400, str(e)) from None
 
 
 @app.delete("/api/scenario/images/{fname}", dependencies=ADMIN)

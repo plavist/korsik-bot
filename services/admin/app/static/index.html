@@ -56,6 +56,9 @@
   .hb .tr { height:12px; background:#eef1f3; border-radius:4px; overflow:hidden; display:flex } .hb .tr i { display:block; height:100% }
   .hb span.v { text-align:right; font-variant-numeric:tabular-nums }
   .rk { padding:2px 9px; border-radius:99px; font-size:12px; white-space:nowrap } .rk.high { background:#fbe3e0; color:#a12626 } .rk.medium { background:#fff3d6; color:#8a5a00 } .rk.low { background:#e2f4e8; color:#006300 }
+  .tlight { display:inline-flex; align-items:center; gap:6px; white-space:nowrap; font-weight:600 } .tlight i { width:14px; height:14px; border-radius:50%; display:inline-block }
+  .tlight.red i { background:#d6453d; box-shadow:0 0 0 3px #fbe3e0 } .tlight.yellow i { background:#e8a317; box-shadow:0 0 0 3px #fff3d6 } .tlight.green i { background:#2e9e5b; box-shadow:0 0 0 3px #e2f4e8 } .tlight.grey i { background:#b4c0c8; box-shadow:0 0 0 3px #edf1f3 }
+  button.s.on { outline:2px solid var(--brand) }
   .sc { display:inline-block; height:8px; border-radius:4px; background:#e34948; vertical-align:middle; margin-right:6px }
   .spill { padding:1px 8px; border-radius:99px; font-size:11px; background:#eef1f3 } .spill.negative { background:#fbe3e0; color:#a12626 } .spill.positive { background:#e1edfb; color:#184f95 }
   .cl { border:1px solid var(--line); border-radius:10px; padding:10px 12px; margin-bottom:8px } .cl q { display:block; color:var(--muted); font-size:13px; margin-top:4px; quotes:"«" "»" }
@@ -127,6 +130,10 @@
     </div>
     <div class="grid" id="kpis" style="margin-bottom:16px"></div>
     <div class="card hide" id="drill"><div style="display:flex;justify-content:space-between;gap:8px"><h2 id="drilltitle" style="margin:0"></h2><button class="s keep" onclick="$('#drill').classList.add('hide')">Закрыть ✕</button></div><div id="drillbody" style="margin-top:10px"></div></div>
+    <div class="card" id="statuscard"><h2>Статус адаптации новичков</h2>
+      <div class="muted" style="font-size:12px">Светофор по каждому сотруднику: 🔴 нужна реакция · 🟡 внимание · 🟢 всё идёт по плану · ⚪ ещё не подключён к боту. Нажмите на цвет, чтобы отфильтровать; клик по строке — диалог.</div>
+      <div class="filters" id="st_chips" style="margin:10px 0"></div>
+      <table><thead><tr><th>Светофор</th><th>Сотрудник</th><th>Площадка</th><th>Фаза</th><th>Прогресс</th><th>Сейчас / дальше</th><th>Почему</th></tr></thead><tbody id="statusrows"></tbody></table></div>
     <div class="cols">
       <div class="card"><h2>Сообщения по дням и тональности</h2><div class="legend" id="lg_days"></div><div class="chart" id="ch_days"></div></div>
       <div class="card"><h2>Средняя тональность по дням</h2><div class="muted" style="font-size:12px">ниже нуля — негативно, выше — нейтрально</div><div class="chart" id="ch_trend"></div></div>
@@ -274,7 +281,7 @@ window.alert = m => toast(m);
 function vOk(...els) { for (const el of els) { if (el && !el.checkValidity()) { el.reportValidity(); return false; } } return true; }
 document.addEventListener('input', e => e.target.setCustomValidity && e.target.setCustomValidity(''));
 const todayIso = () => new Date().toISOString().slice(0, 10);
-const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const api = (svc, p, o) => fetch(`/api/${svc}/${p}`, o);
 const fmt = t => new Date(t * 1000).toLocaleString('ru-RU', { hour12: false });
 // поле времени всегда в 24-часовом формате ЧЧ:ММ (без AM/PM): двоеточие подставляется само
@@ -294,10 +301,10 @@ function renderDocs() {
   $('#rows').innerHTML = docs.map(d => `<tr><td>${esc(d.title)}</td><td class="muted">${esc(d.filename)}</td>
     <td><span class="pill ${d.status}">${{ready:'готово',processing:'обработка…',error:'ошибка'}[d.status] || d.status}</span>${d.error ? `<div class="muted">${esc(d.error)}</div>` : ''}</td>
     <td>${d.pages} / ${d.chunks} / ${d.ocr_pages}</td>
-    <td>${d.status === 'ready' ? `<button class="s keep" onclick="view('${d.id}','${esc(d.title)}')">Текст</button> ` : ''}${d.source === 'base' ? '<span class="muted" title="Из папки базовых документов: удаляется только удалением файла из папки">базовый</span>' : `<button class="s" onclick="del('${d.id}')">Удалить</button>`}</td></tr>`).join('')
+    <td>${d.status === 'ready' ? `<button class="s keep" onclick="view('${d.id}')">Текст</button> ` : ''}${d.source === 'base' ? '<span class="muted" title="Из папки базовых документов: удаляется только удалением файла из папки">базовый</span>' : `<button class="s" onclick="del('${d.id}')">Удалить</button>`}</td></tr>`).join('')
     || '<tr><td colspan=5 class="muted">Документов нет</td></tr>';
 }
-async function view(id, title) { $('#viewer').classList.remove('hide'); $('#vtitle').textContent = 'Распознанный текст: ' + title;
+async function view(id) { const d = DOCS.find(x => x.id === id); $('#viewer').classList.remove('hide'); $('#vtitle').textContent = 'Распознанный текст: ' + (d ? d.title : '');
   $('#vtext').textContent = await (await api('ingest', `documents/${id}/text`)).text(); $('#viewer').scrollIntoView(); }
 async function del(id) { if (confirm('Удалить документ и его векторы?')) { await api('ingest', 'documents/' + id, { method: 'DELETE' }); loadDocs(); } }
 const DOC_EXT = ['pdf', 'pptx', 'docx', 'txt', 'md', 'png', 'jpg', 'jpeg'];
@@ -352,28 +359,39 @@ async function loadDash() {
   $('#dash').style.opacity = .6;
   const mgr = isMgr();
   $('#f_mgr_l').classList.toggle('hide', mgr); $('#digestcard').classList.toggle('hide', mgr);
-  const reqs = [get('api/analytics'), get('api/insights/stages'), get('api/insights/risk'), get('api/insights/funnel'), get('api/insights/comments'),
+  const days = Number($('#f_days').value) || 3650;
+  const usageReq = mgr ? Promise.resolve(null) : api('pipeline', `api/usage?days=${days}`).then(r => r.ok ? r.json() : null).catch(() => null);
+  const reqs = [usageReq, get('api/analytics'), get('api/insights/stages'), get('api/insights/risk'), get('api/insights/status'), get('api/insights/funnel'), get('api/insights/comments'),
     api('pipeline', 'api/surveys').then(r => r.json()), api('pipeline', 'api/insights/notices' + (mgr ? '' : ($('#f_mgr').value ? '?manager=' + encodeURIComponent($('#f_mgr').value) : ''))).then(r => r.json())];
-  const [a, stages, risk, funnel, comments, surveys, notices] = await Promise.all(reqs);
-  DASH = { a, stages, risk, comments, surveys };
+  const [usage, a, stages, risk, status, funnel, comments, surveys, notices] = await Promise.all(reqs);
+  DASH = { a, stages, risk, status, comments, surveys, usage };
   if (!mgr && $('#f_mgr').options.length <= 1) { const ms = await (await api('pipeline', 'api/insights/managers')).json();
     ms.forEach(m => { const o = document.createElement('option'); o.value = o.textContent = m; $('#f_mgr').appendChild(o); }); }
-  kpis(a, risk); daysChart(a.daily); trendChart(a.daily); topics(a.topics_detail || []); stagesChart(stages);
-  riskTable(risk); funnelTable(funnel); surveysTable(surveys); flags(a.red_flags); noticesList(notices);
+  kpis(a, risk, usage); daysChart(a.daily); trendChart(a.daily); topics(a.topics_detail || []); stagesChart(stages);
+  statusTable(status); riskTable(risk); funnelTable(funnel); surveysTable(surveys); flags(a.red_flags); noticesList(notices);
   $('#f_note').textContent = `${a.filters.days ? 'за ' + a.filters.days + ' дн.' : 'за всё время'}${a.filters.site ? ' · ' + a.filters.site : ''}${a.filters.manager ? ' · рук. ' + a.filters.manager : ''}${a.filters.topic ? ' · тема: ' + a.filters.topic : ''}${a.filters.sentiment ? ' · ' + SENT_L[a.filters.sentiment] : ''}`;
   $('#dash').style.opacity = 1;
 }
 ['#f_days', '#f_site', '#f_mgr', '#f_topic', '#f_sent'].forEach(i => $(i).onchange = () => { $('#drill').classList.add('hide'); loadDash(); });
 $('#f_reset').onclick = () => { $('#f_days').value = '30'; $('#f_site').value = ''; $('#f_mgr').value = ''; $('#f_topic').value = ''; $('#f_sent').value = ''; loadDash(); };
 
-function kpis(a, risk) {
+const nf = n => new Intl.NumberFormat('ru-RU').format(n);
+function usageTile(u) {
+  if (!u || !Object.keys(u.totals || {}).length) return null;
+  const tokens = Object.values(u.totals).reduce((s, t) => s + t.prompt_tokens + t.completion_tokens, 0);
+  const requests = Object.values(u.totals).reduce((s, t) => s + t.requests, 0);
+  const cost = u.cost == null ? `${nf(requests)} запросов к модели` : `≈ ${nf(u.cost)} ${u.currency} · ${nf(requests)} запросов`;
+  return ['Расход модели', tokens >= 1e6 ? (tokens / 1e6).toFixed(1).replace('.', ',') + ' млн' : nf(tokens), cost + ' · токенов', null];
+}
+function kpis(a, risk, usage) {
   const hi = risk.filter(r => r.level !== 'low').length, neg = a.sentiments.negative || 0, open = a.escalations.open || 0;
   const t = [['Пользователей', a.users, 'писали боту', null], ['Вопросов', a.user_messages, 'к боту', () => drill({}, 'Все сообщения')],
     ['Ответов по базе знаний', a.grounded_rate == null ? '—' : Math.round(a.grounded_rate * 100) + '%', 'без выдумок', null],
     ['Негативных сообщений', neg, 'показать', () => drill({ sentiment: 'negative' }, 'Негативные сообщения')],
     ['Красных флагов', a.red_flags.length, 'показать', () => drill({ red_flag: true }, 'Красные флаги')],
     ['Открытых обращений', open, mgr0() ? '' : 'к обращениям', mgr0() ? null : () => goTab('esc')],
-    ['В зоне риска', hi, 'показать', () => document.getElementById('risk').scrollIntoView({ behavior: 'smooth' })]];
+    ['Закрыто без HR', a.handled.share == null ? '—' : Math.round(a.handled.share * 100) + '%', `бот ответил сам: ${a.handled.answered}, передано HR: ${a.handled.handed_over}`, null],
+    ['В зоне риска', hi, 'показать', () => document.getElementById('risk').scrollIntoView({ behavior: 'smooth' })], usageTile(usage)].filter(Boolean);
   $('#kpis').replaceChildren(...t.map(([l, v, sub, fn]) => { const d = document.createElement('div'); d.className = 'kpi' + (fn ? ' click' : '');
     d.innerHTML = `<b>${esc(v)}</b>${esc(l)}<small>${esc(sub)}</small>`; if (fn) d.onclick = fn; return d; }));
 }
@@ -441,6 +459,23 @@ function stagesChart(stages) {
     d.onpointermove = e => showTip(e, [{ v: s.employees.length, l: 'новичков · ' + s.stage, key: C.seq[i] }]); d.onpointerleave = hideTip; return d; }));
 }
 
+const LIGHT_L = { red: 'Красный', yellow: 'Жёлтый', green: 'Зелёный', grey: 'Не подключён' };
+let ST_FILTER = '';
+function statusTable(list) {
+  const counts = Object.fromEntries(['red', 'yellow', 'green', 'grey'].map(k => [k, list.filter(s => s.light === k).length]));
+  $('#st_chips').replaceChildren(...['', 'red', 'yellow', 'green', 'grey'].map(k => { const b = document.createElement('button'); b.className = 's keep' + (ST_FILTER === k ? ' on' : '');
+    b.innerHTML = k ? `<span class="tlight ${k}"><i></i>${LIGHT_L[k]}</span> · ${counts[k]}` : `Все · ${list.length}`;
+    b.onclick = () => { ST_FILTER = k; statusTable(list); }; return b; }));
+  const rows = list.filter(s => !ST_FILTER || s.light === ST_FILTER), body = $('#statusrows');
+  body.replaceChildren(...rows.map(s => { const tr = document.createElement('tr'), pct = s.progress.total ? 100 * s.progress.done / s.progress.total : 0;
+    tr.innerHTML = `<td><span class="tlight ${s.light}"><i></i>${LIGHT_L[s.light]}</span></td><td></td><td></td><td></td>
+      <td style="white-space:nowrap"><span class="sc" style="width:${Math.max(3, pct * .6)}px;background:${C.seq[2]}"></span>${s.progress.done} / ${s.progress.total}</td><td class="muted"></td><td class="muted"></td>`;
+    tr.children[1].replaceChildren(nm(s.name, s.user_id, s.id)); tr.children[2].textContent = siteName(s.site); tr.children[3].textContent = s.phase;
+    tr.children[5].textContent = [s.last_step ? '✓ ' + s.last_step : '', s.next_step ? '→ ' + s.next_step.title + (s.next_step.due ? ' (' + s.next_step.due.slice(0, 10) + ')' : '') : ''].filter(Boolean).join('\n') || '—';
+    tr.children[5].style.whiteSpace = 'pre-line'; tr.children[6].textContent = s.reasons.join('; ');
+    if (s.user_id) { tr.className = 'click'; tr.onclick = () => openChat(s.user_id, s.name); } return tr; }));
+  if (!rows.length) body.innerHTML = '<tr><td colspan=7 class="muted">Нет сотрудников с таким статусом</td></tr>';
+}
 function riskTable(risk) {
   const body = $('#risk'); body.replaceChildren(...risk.map(r => { const tr = document.createElement('tr'); tr.className = 'click';
     tr.innerHTML = `<td></td><td></td><td></td><td style="white-space:nowrap"><span class="sc" style="width:${Math.max(3, r.score * .6)}px"></span><b>${r.score}</b> <span class="rk ${r.level}">${RISK_L[r.level]}</span></td><td class="muted"></td>`;
@@ -534,7 +569,7 @@ function renderEsc() {
   const body = $('#escrows'); body.replaceChildren(...rows.map(e => { const tr = document.createElement('tr'); tr.className = 'click'; tr.onclick = () => openDlg(e.id);
     tr.innerHTML = `<td class="muted">${fmt(e.created_at)}</td><td></td><td></td><td></td><td><span class="tn ${e.tone}">${TONE[e.tone]}</span></td><td onclick="event.stopPropagation()"><select>${Object.entries(ESC_STATUS).map(([k, v]) => `<option value="${k}" ${k === e.status ? 'selected' : ''}>${v}</option>`).join('')}</select></td>`;
     tr.children[1].replaceChildren(nm(e.name, e.user_id)); tr.children[2].textContent = e.site ? siteName(e.site) : '—';
-    tr.children[3].textContent = e.message.length > 90 ? e.message.slice(0, 90) + '…' : e.message; tr.children[3].title = e.message;
+    tr.children[3].textContent = (e.message.length > 90 ? e.message.slice(0, 90) + '…' : e.message) + (e.repeats > 1 ? ` · ещё ${e.repeats - 1} в этом обращении` : ''); tr.children[3].title = e.message;
     tr.querySelector('select').onchange = ev => setEsc(e.id, ev.target.value); return tr; }));
   if (!rows.length) body.innerHTML = '<tr><td colspan=6 class="muted">Обращений нет</td></tr>';
 }
@@ -560,7 +595,7 @@ setInterval(() => { if (tab === 'dlg') loadDlg(); }, 4000);
 const setEsc = async (id, status) => { await api('pipeline', `api/escalations/${id}/status`, { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ status }) }); const e = ESC.find(x => x.id === id); if (e) e.status = status; renderEsc(); };
 
 // ---------- сотрудники ----------
-const KINDS = { agent: 'бот предложил, сотрудник подтвердил', forward: 'написал через Корсика', unanswered: 'вопрос без ответа в базе', intent: 'бот предложил по смыслу вопроса, сотрудник подтвердил', command: 'команда /HR', contact: 'просит рекрутера', survey: 'флаг из опроса', sentiment: 'красный флаг (тональность)' };
+const KINDS = { agent: 'бот передал сразу (личный или тревожный вопрос)', forward: 'написал через Корсика', unanswered: 'нет ответа в базе — передано автоматически, в чат ничего не писали', intent: 'передано автоматически по смыслу вопроса', command: 'команда /HR', contact: 'просит рекрутера', survey: 'флаг из опроса', sentiment: 'красный флаг (тональность)' };
 const STATUS = { done: 'готово', sent: 'отправлено', skipped: 'пропущено', error: 'ошибка', due: 'пора отправить', scheduled: 'по расписанию', waiting_recruiter: 'ждёт отмашки', 'n/a': 'не для этой площадки' };
 let curEmp = null;
 let EMPS = [];
@@ -591,7 +626,8 @@ $('#ecreate').onclick = async () => {
   if (!r.ok) { $('#emsg').textContent = 'Ошибка: ' + ((await r.json()).detail || r.status); return; }
   const e = await r.json(); $('#emsg').textContent = ''; $('#en').value = ''; $('#em').value = ''; $('#emu').value = ''; curEmp = e.id; loadEmp();
 };
-async function setManager(id, name, user) {
+async function setManager(id) {
+  const cur = EMPS.find(x => x.id === id) || {}, name = cur.manager || '', user = cur.manager_user || '';   // значения берём из данных, а не из разметки: имя может содержать кавычки
   const n = prompt('Руководитель подразделения (ФИО, как в учётной записи руководителя)', name); if (n === null) return;
   if (n.trim() && n.trim().split(/\s+/).length < 2) { toast('Руководитель: укажите имя и фамилию (например, Сергей Иванов)', 'err'); return; }
   const u = prompt('ID чата руководителя в MAX для push-напоминаний (можно пусто)', user); if (u === null) return;
@@ -606,7 +642,7 @@ async function openEmp(id, keep) {
     <td>${t.status === 'n/a' ? '' : `<button class="s" onclick="sendStep(${e.id},'${t.id}')">Отправить сейчас</button>`}</td></tr>`).join('');
   const ans = e.answers.map(a => `<tr><td>${esc(a.survey)}</td><td>${esc(a.qkey)}</td><td>${esc(a.label || a.value)}</td><td>${esc(a.comment || '')}</td></tr>`).join('') || '<tr><td colspan=4 class="muted">Ответов пока нет</td></tr>';
   box.innerHTML = `<h2>${esc(e.name)} · ${esc(siteName(e.site))} · выход ${esc(e.hire_date)}${e.is_office ? '' : ' · не офис'}</h2>
-    <p>Руководитель: <b>${esc(e.manager || 'не указан')}</b>${e.manager_user ? ' · push в чат ' + esc(e.manager_user) : ''} <button class="s" onclick="setManager(${e.id}, '${esc(e.manager || '')}', '${esc(e.manager_user || '')}')">Изменить</button></p>
+    <p>Руководитель: <b>${esc(e.manager || 'не указан')}</b>${e.manager_user ? ' · push в чат ' + esc(e.manager_user) : ''} <button class="s" onclick="setManager(${e.id})">Изменить</button></p>
     <p>Код привязки: <span class="code">${e.code}</span> ${e.link ? `· ссылка: <a href="${esc(e.link)}" target="_blank">${esc(e.link)}</a>` : ''}<br>
     <span class="muted">Сотрудник пишет боту <code>/start ${e.code}</code> (в MAX — по ссылке с кнопкой «Начать»).</span></p>
     <div class="form"><label>Привязать к MAX ID<select id="bindsel">${users.map(u => `<option value="${esc(u.user_id)}" ${u.user_id === e.user_id ? 'selected' : ''}>${esc(u.user_id)}</option>`).join('')}</select></label>

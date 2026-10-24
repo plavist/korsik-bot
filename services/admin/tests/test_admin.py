@@ -75,3 +75,26 @@ def test_proxy_put_and_patch_methods():
     assert client.put("/api/pipeline/api/scenario/text", auth=AUTH, json={"step_id": "a", "idx": 0, "text": "t"}).json() == {"ok": True}
     assert client.patch("/api/pipeline/api/employees/1", auth=AUTH, json={"name": "x"}).json() == {"id": 1}
     assert put.called and patch.called
+
+
+# ---------- безопасность интерфейса: XSS и заголовки ----------
+def test_inline_handlers_embed_only_server_generated_identifiers():
+    """Значение из данных внутри обработчика onclick="…" попадает в JS: HTML-экранирование не защищает (браузер раскодирует апостроф
+    обратно). Поэтому туда разрешены только идентификаторы, которые формирует сервер (uuid, числа, ограниченные шаблоном имена);
+    всё остальное — названия, ФИО, тексты — берётся из загруженных данных по id."""
+    import re
+    from pathlib import Path
+    html = (Path(__file__).parent.parent / "app" / "static" / "index.html").read_text(encoding="utf-8")
+    SAFE = {"d.id", "e.id", "t.id", "x.file", "sid", "i.idx", "c.name", "u.login", "!u.active"}   # uuid · число · up_<hex>.jpg · [a-z0-9_] · [A-Za-z0-9_.-]
+    used = {m for h in re.findall(r"""on\w+="([^"]*)\"""", html) for m in re.findall(r"\$\{([^}]*)\}", h)}
+    assert used and used <= SAFE, f"в обработчики попали несогласованные данные: {sorted(used - SAFE)}"
+    assert "&#39;" in html     # апостроф экранируется для HTML-атрибутов (на JS-строки обработчика это не распространяется)
+
+
+def test_security_headers_on_every_response():
+    r = client.get("/", auth=("hr", "admin"))
+    assert r.status_code == 200
+    csp = r.headers["content-security-policy"]
+    assert "frame-ancestors 'none'" in csp and "default-src 'self'" in csp and "base-uri 'none'" in csp
+    assert r.headers["x-frame-options"] == "DENY" and r.headers["x-content-type-options"] == "nosniff" and r.headers["referrer-policy"] == "no-referrer"
+    assert client.get("/api/rbac/me").headers["x-frame-options"] == "DENY"                 # и на ответах с ошибкой 401

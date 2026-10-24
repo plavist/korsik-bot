@@ -40,7 +40,7 @@ async def sync() -> dict:
         old = by_name.get(f.name)
         if old and old["status"] == "ready":
             with db.conn() as c:
-                c.execute("UPDATE documents SET source='base', sha=? WHERE id=?", (sha, old["id"]))
+                c.execute("UPDATE documents SET source='base', sha=%s WHERE id=%s", (sha, old["id"]))
             continue
         doc_id = uuid.uuid4().hex
         uploads = Path(config.data_dir()) / "uploads"

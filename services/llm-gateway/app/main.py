@@ -4,11 +4,17 @@
 алиасы моделей ("chat", "embed") и URL этого сервиса.
 """
 import asyncio
+import logging
 import os
+import time
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
+
+from . import pg
+
+log = logging.getLogger("gateway")
 
 app = FastAPI(title="llm-gateway")
 
@@ -61,13 +67,40 @@ async def call_upstream(cfg: dict, path: str, payload: dict) -> httpx.Response:
                 resp = await client.post(cfg["base_url"].rstrip("/") + path, json=payload, headers=headers)
             except httpx.TransportError as e:
                 if i == attempts - 1:
-                    raise HTTPException(502, f"upstream unreachable: {e}")
+                    raise HTTPException(502, f"upstream unreachable: {e}") from None
             else:
                 if resp.status_code not in RETRY_STATUSES:
                     return resp
             await asyncio.sleep(float(os.getenv("RETRY_BACKOFF", "1")) * (i + 1))
     assert resp is not None
     return resp
+
+
+def record_usage(kind: str, model: str, resp: httpx.Response) -> None:
+    """Учёт расхода токенов по дням (для оценки стоимости). Сбой учёта не должен ломать запрос."""
+    if resp.status_code != 200:
+        return
+    try:
+        usage = resp.json().get("usage") or {}
+        p, c = int(usage.get("prompt_tokens") or 0), int(usage.get("completion_tokens") or 0)
+        with pg.conn() as db:
+            db.execute(
+                "INSERT INTO llm_usage(day, kind, model, requests, prompt_tokens, completion_tokens) VALUES (%s,%s,%s,1,%s,%s) "
+                "ON CONFLICT (day, kind, model) DO UPDATE SET requests = llm_usage.requests + 1, "
+                "prompt_tokens = llm_usage.prompt_tokens + excluded.prompt_tokens, "
+                "completion_tokens = llm_usage.completion_tokens + excluded.completion_tokens",
+                (time.strftime("%Y-%m-%d", time.gmtime()), kind, model, p, c))
+    except Exception:  # noqa: BLE001
+        log.exception("usage accounting failed")
+
+
+def price(kind: str, prompt: int, completion: int) -> float | None:
+    """Стоимость по ценам из окружения (за 1 млн токенов): LLM_PRICE_IN/LLM_PRICE_OUT, EMBED_PRICE; нет цен — None."""
+    if kind == "chat":
+        pin, pout = os.getenv("LLM_PRICE_IN"), os.getenv("LLM_PRICE_OUT")
+        return None if pin is None or pout is None else (prompt * float(pin) + completion * float(pout)) / 1e6
+    pe = os.getenv("EMBED_PRICE")
+    return None if pe is None else (prompt + completion) * float(pe) / 1e6
 
 
 def relay(resp: httpx.Response) -> JSONResponse:
@@ -95,7 +128,9 @@ async def chat(request: Request):
     cfg, model = route("chat", payload.get("model"))
     payload["model"] = model
     payload.pop("stream", None)
-    return relay(await call_upstream(cfg, "/chat/completions", payload))
+    resp = await call_upstream(cfg, "/chat/completions", payload)
+    record_usage("chat", model, resp)
+    return relay(resp)
 
 
 @app.post("/v1/embeddings")
@@ -105,4 +140,27 @@ async def embeddings(request: Request):
         raise HTTPException(400, "input is required")
     cfg, model = route("embed", payload.get("model"))
     payload["model"] = model
-    return relay(await call_upstream(cfg, "/embeddings", payload))
+    resp = await call_upstream(cfg, "/embeddings", payload)
+    record_usage("embed", model, resp)
+    return relay(resp)
+
+
+@app.get("/usage")
+async def usage(days: int = 30):
+    """Расход токенов за период: по дням и видам, итоги и стоимость (если заданы цены LLM_PRICE_IN/OUT, EMBED_PRICE)."""
+    days = max(1, min(days, 3650))
+    since = time.strftime("%Y-%m-%d", time.gmtime(time.time() - days * 86400))
+    with pg.conn() as db:
+        rows = [dict(r) for r in db.execute("SELECT * FROM llm_usage WHERE day >= %s ORDER BY day, kind, model", (since,))]
+    totals: dict[str, dict] = {}
+    for r in rows:
+        t = totals.setdefault(r["kind"], {"requests": 0, "prompt_tokens": 0, "completion_tokens": 0})
+        t["requests"] += r["requests"]
+        t["prompt_tokens"] += r["prompt_tokens"]
+        t["completion_tokens"] += r["completion_tokens"]
+    for kind, t in totals.items():
+        t["cost"] = price(kind, t["prompt_tokens"], t["completion_tokens"])
+    costs = [t["cost"] for t in totals.values()]
+    return {"days": days, "rows": rows, "totals": totals,
+            "cost": None if not costs or any(c is None for c in costs) else round(sum(costs), 4),
+            "currency": os.getenv("PRICE_CURRENCY", "USD")}

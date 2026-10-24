@@ -26,7 +26,7 @@ SITE_TITLES: dict = {}
 SITE_OFFICE: dict = {}
 
 REASON_PROMPT = "Расскажи, пожалуйста, что именно не устроило? Твой ответ поможет нам сделать адаптацию лучше 🙏"
-HR_FORWARD_PROMPT = "Напиши, пожалуйста, что случилось — я покажу, что именно уйдёт в отдел подбора персонала, и передам только после твоего подтверждения 🤝"
+HR_FORWARD_PROMPT = "Напиши, пожалуйста, что случилось — я сразу передам это в отдел подбора персонала 🤝"
 SURVEY_REMINDER = ("Привет, {name}!\nПишу с небольшим напоминанием, что ты не прошел опрос. \n"
                    "Пожалуйста, не забудь это сделать в ближайшее время.\n\nP.S.: Он займет всего 1-2 минуты!")
 FALLBACK_QUESTION = ("Какие-то вопросы слишком сложные, чтобы я мог решить их самостоятельно. "
@@ -508,7 +508,7 @@ def validate_due(spec) -> dict | None:
         assert 0 <= int(h) < 24 and 0 <= int(m) < 60 and len(h) == 2 and len(m) == 2
         assert out["anchor"] in ("hire", "end") and -400 <= out["days"] <= 400 and -24 <= out["months"] <= 24
     except (AttributeError, TypeError, ValueError, AssertionError):
-        raise ValueError("срок: точка отсчёта (выход / конец испытательного срока), смещение и время ЧЧ:ММ")
+        raise ValueError("срок: точка отсчёта (выход / конец испытательного срока), смещение и время ЧЧ:ММ") from None
     if out["workdays"] and (out["days"] < 0 or out["months"]):
         raise ValueError("рабочие дни считаются только вперёд и без месяцев")
     return out

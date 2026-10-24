@@ -53,8 +53,8 @@ async def test_agent_escalates():
         llm_reply("Передал HR."),
     ])
     res = await agent.answer("u7", "max", "Мне не доплатили")
-    # агент только ПРЕДЛАГАЕТ передать вопрос HR: без подтверждения пользователя ничего не уходит
-    assert res["draft"] == {"kind": "agent", "reason": "Хочу обсудить зарплату"} and not res["escalated"] and not res["hr_options"]
+    # агент лишь возвращает причину передачи; обращение создаёт bot.py (бесшовная эскалация), сам агент в базу не пишет
+    assert res["draft"] == {"kind": "agent", "reason": "Хочу обсудить зарплату"} and not res["hr_options"] and not res["failed"]
     assert db.list_escalations() == []
 
 

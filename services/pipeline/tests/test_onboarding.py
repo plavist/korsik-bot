@@ -88,7 +88,7 @@ def test_persona_prompt_has_regulation_rules():
     emp = {"name": "Анна Иванова", "site": "GTP", "hire_date": "2026-11-02", "form": "vy"}
     p = style.persona_prompt(emp)
     assert "МУЖСКОМ роде" in p and "на «вы»" in p and "Анна" in p and "ГТП" in p
-    assert "Какие-то вопросы слишком сложные" in p and "search_knowledge_base" in p and "escalate_to_hr" in p
+    assert "ничего не покажет человеку" in p and "search_knowledge_base" in p and "escalate_to_hr" in p
     anon = style.persona_prompt(None)
     assert "не привязан" in anon and "{" not in anon.replace("{name}", "")  # плейсхолдеры подставлены
 

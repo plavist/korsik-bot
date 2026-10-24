@@ -38,11 +38,12 @@ async def test_analyze_failure_swallowed():
 def test_analytics_empty_and_rates():
     a = db.analytics()
     assert a["grounded_rate"] is None and a["users"] == 0 and a["daily"] == []
-    db.add_message("u", "web", "user", "q")
+    db.set_sentiment(db.add_message("u", "web", "user", "q"), "neutral", 0.0, ["другое"], False)
+    db.add_message("u", "web", "user", "/start")                                  # без оценки — в статистику не входит
     db.add_message("u", "web", "assistant", "a", grounded=True)
     db.add_message("u2", "web", "assistant", "b", grounded=False)
     a = db.analytics()
-    assert a["grounded_rate"] == 0.5 and a["users"] == 1 and a["daily"][0]["n"] == 1
+    assert a["grounded_rate"] == 0.5 and a["users"] == 1 and a["user_messages"] == 1 and a["daily"][0]["n"] == 1
 
 
 def test_settings_and_escalation_status():

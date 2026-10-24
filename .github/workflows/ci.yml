@@ -1,0 +1,29 @@
+name: ci
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env: {POSTGRES_USER: test, POSTGRES_PASSWORD: test, POSTGRES_DB: korsik_test}
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U test -d korsik_test" --health-interval 5s --health-timeout 3s --health-retries 20
+    env:
+      TEST_DATABASE_URL: postgresql://test:test@127.0.0.1:5432/korsik_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - name: Линтер и анализ безопасности
+        run: |
+          uvx ruff check services --select F,B904 --exclude '*/tests/*'
+          uvx bandit -q -r services/pipeline/app services/ingest/app services/admin/app services/llm-gateway/app -lll
+      - name: Тесты (покрытие строк и ветвей)
+        run: |
+          for s in llm-gateway ingest pipeline admin; do
+            (cd services/$s && uv run --frozen pytest -q --cov=app --cov-branch --cov-fail-under=97)
+          done

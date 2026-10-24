@@ -196,34 +196,33 @@ def test_manager_permissions_table_and_insights_writes():
     assert rbac.required("POST", "pipeline", "api/insights/digest/send") == "employees"
     assert rbac.required("PUT", "pipeline", "api/insights/digest/settings") == "employees"
     assert rbac.required("GET", "pipeline", "api/insights/digest") is None
-    assert rbac.manager_can_read("pipeline", "api/analytics/drill") and rbac.manager_can_read("pipeline", "api/employees")
+    assert rbac.manager_can_read("pipeline", "api/analytics/drill") and rbac.manager_can_read("pipeline", "api/employees") and rbac.manager_can_read("pipeline", "api/insights/status")
     assert not rbac.manager_can_read("ingest", "api/analytics") and not rbac.manager_can_read("pipeline", "api/analyticsX")
     assert "manager" in {r["role"] for r in client.get("/api/rbac/roles", auth=ROOT).json()}
 
 
-def test_users_migration_adds_manager_column(tmp_path, monkeypatch):
-    import sqlite3
-    monkeypatch.setenv("DATA_DIR", str(tmp_path))
-    c = sqlite3.connect(str(tmp_path / "admin.db"))
-    c.execute("CREATE TABLE users(login TEXT PRIMARY KEY, name TEXT, role TEXT, salt TEXT, pw_hash TEXT, active INTEGER DEFAULT 1, created_at REAL)")
-    c.commit()
-    c.close()
-    assert users.list_users() == []
+def test_schema_init_is_idempotent_and_users_have_manager_column():
+    from app import pg
+    pg.close()
+    pg.pool()                                   # повторный старт сервиса: DDL выполняется снова и ничего не ломает
+    with users.conn() as c:
+        cols = {r["column_name"] for r in c.execute("SELECT column_name FROM information_schema.columns WHERE table_schema='admin' AND table_name='users'")}
+    assert "manager" in cols and users.list_users() == []
 
 
 # ---------- пароли хранятся только в виде хеша ----------
 def test_passwords_are_stored_hashed_not_plain():
-    import sqlite3
-    import os
     secret = "Sup3r-Secret-Pass"
     mk("hashed", "viewer", password=secret)
-    db = sqlite3.connect(os.path.join(os.environ["DATA_DIR"], "admin.db"))
-    row = db.execute("SELECT salt, pw_hash FROM users WHERE login='hashed'").fetchone()
-    raw = open(os.path.join(os.environ["DATA_DIR"], "admin.db"), "rb").read()
-    assert secret.encode() not in raw and row[1] != secret and len(row[1]) == 128 and len(row[0]) == 32     # scrypt: 64 байта, соль 16 байт
+    with users.conn() as c:
+        row = c.execute("SELECT salt, pw_hash FROM users WHERE login='hashed'").fetchone()
+        dump = " ".join(str(v) for r in c.execute("SELECT * FROM users") for v in r.values())
+    assert secret not in dump and row["pw_hash"] != secret and len(row["pw_hash"]) == 128 and len(row["salt"]) == 32   # scrypt: 64 байта, соль 16 байт
     mk("hashed2", "viewer", password=secret)
-    assert db.execute("SELECT pw_hash FROM users WHERE login='hashed2'").fetchone()[0] != row[1]           # у одинаковых паролей разная соль → разный хеш
-    assert users._hash(secret, row[0]) == row[1] and users._hash("другой", row[0]) != row[1]
+    with users.conn() as c:
+        other = c.execute("SELECT pw_hash FROM users WHERE login='hashed2'").fetchone()["pw_hash"]
+    assert other != row["pw_hash"]                                                                               # у одинаковых паролей разная соль → разный хеш
+    assert users._hash(secret, row["salt"]) == row["pw_hash"] and users._hash("другой", row["salt"]) != row["pw_hash"]
 
 
 @respx.mock

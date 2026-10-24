@@ -28,6 +28,24 @@ def auth(request: Request, cred: HTTPBasicCredentials = Depends(security)) -> di
 app = FastAPI(title="admin", dependencies=[Depends(auth)])
 app.add_exception_handler(RequestValidationError, V.validation_handler)
 
+# Заголовки безопасности. Интерфейс — один HTML с инлайн-скриптом, поэтому script-src разрешает 'unsafe-inline';
+# остальное закрыто: чужие домены, встраивание во фрейм, <base>, отправка форм наружу.
+SECURITY_HEADERS = {
+    "Content-Security-Policy": "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; "
+                               "img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+    "Referrer-Policy": "no-referrer",
+}
+
+
+@app.middleware("http")
+async def security_headers(request: Request, call_next):
+    response = await call_next(request)
+    for k, v in SECURITY_HEADERS.items():
+        response.headers.setdefault(k, v)
+    return response
+
 
 def need(user: dict, perm: str | None) -> None:
     if not rbac.can(user["role"], perm):
@@ -126,7 +144,7 @@ async def create_user(body: UserIn, user: dict = Depends(auth)):
     try:
         users.create(body.login, body.name, body.role, body.password, body.manager)
     except ValueError as e:
-        raise HTTPException(400, str(e))
+        raise HTTPException(400, str(e)) from None
     users.log(user["login"], f"создал пользователя {body.login} ({body.role})")
     return {"ok": True}
 
@@ -139,7 +157,7 @@ async def update_user(login: str, body: UserPatch, user: dict = Depends(auth)):
     try:
         found = users.update(login, body.name, body.role, body.active, body.password, body.manager)
     except ValueError as e:
-        raise HTTPException(400, str(e))
+        raise HTTPException(400, str(e)) from None
     if not found:
         raise HTTPException(404, "пользователь не найден")
     users.log(user["login"], f"изменил пользователя {login}" + (" (сменил пароль)" if body.password else ""))
@@ -196,7 +214,7 @@ async def proxy(service: str, path: str, request: Request, user: dict = Depends(
             r = await c.request(request.method, f"{upstream(service)}/{path}", params=params,
                                 content=await request.body(), headers=headers)
     except httpx.TransportError as e:
-        raise HTTPException(502, f"{service} недоступен: {e}")
+        raise HTTPException(502, f"{service} недоступен: {e}") from None
     if request.method != "GET" and r.status_code < 400 and rbac.required(request.method, service, path):
         users.log(user["login"], f"{request.method} {service}/{path}")
     return Response(r.content, status_code=r.status_code, media_type=r.headers.get("content-type"))

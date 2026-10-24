@@ -54,6 +54,11 @@ def internal_token() -> str:
     return hashlib.sha256(("internal:" + os.getenv("ADMIN_PASSWORD", "admin")).encode()).hexdigest()
 
 
+def send_retry_delay() -> float:
+    """Пауза между повторными отправками сообщения в МАКС (секунды, растёт с номером попытки)."""
+    return float(os.getenv("MAX_SEND_RETRY_DELAY", "1"))
+
+
 def delete_pressed() -> bool:
     """Удалять ли в MAX сообщение, под которым нажата кнопка (MAX_DELETE_PRESSED=0 — не удалять)."""
     return os.getenv("MAX_DELETE_PRESSED", "1") not in ("0", "false", "no")

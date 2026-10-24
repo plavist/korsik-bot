@@ -33,7 +33,7 @@ def test_reset_clears_runtime_data_and_keeps_initial_content():
     assert res["employees"] == 1 and res["messages"] == 1 and res["escalations"] == 1 and res["images_kept"] == 1
     for t in reset.RUNTIME_TABLES:
         with db.conn() as c:
-            assert c.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0] == 0, t
+            assert c.execute(f"SELECT COUNT(*) AS n FROM {t}").fetchone()["n"] == 0, t
     assert db.get_setting("digest_recipients") is None and db.get_setting("mode") is None and db.get_setting("max_marker") == "555"
     # заложенное осталось: сценарий исходный, вложение на месте, площадки по умолчанию, библиотека, команды по умолчанию
     assert len(sc.STEPS) == 21 and not any(s["title"] == "Свой этап" for s in sc.STEPS)

@@ -14,7 +14,7 @@ PERM_TITLES = {"docs": "база знаний", "scenario": "сценарий", 
                "escalations": "обращения", "channel": "канал доставки", "users": "пользователи"}
 
 # что доступно роли «Руководитель подразделения» (только чтение, данные ограничены его подчинёнными)
-MANAGER_READ = ("api/sites", "api/analytics", "api/insights/stages", "api/insights/funnel", "api/insights/risk", "api/insights/comments",
+MANAGER_READ = ("api/sites", "api/analytics", "api/insights/stages", "api/insights/status", "api/insights/funnel", "api/insights/risk", "api/insights/comments",
                 "api/insights/notices", "api/employees")
 
 

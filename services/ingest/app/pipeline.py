@@ -37,7 +37,7 @@ async def process(doc_id: str, file_path: str, filename: str, title: str) -> Non
                 "vector": v,
                 "payload": {"doc_id": doc_id, "title": title, "filename": filename, "page": page, "chunk": i, "text": text},
             }
-            for i, ((page, text), v) in enumerate(zip(items, vectors))
+            for i, ((page, text), v) in enumerate(zip(items, vectors, strict=True))
         ])
         db.update(
             doc_id, status="ready", error=None, pages=len(pages), chunks=len(items),

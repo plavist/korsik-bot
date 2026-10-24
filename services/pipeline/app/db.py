@@ -1,95 +1,56 @@
 import json
-import sqlite3
 import time
 from contextlib import contextmanager
-from pathlib import Path
 
-from . import config
-
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS messages (
-  id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT, channel TEXT, role TEXT, text TEXT,
-  sources TEXT, grounded INTEGER, sentiment TEXT, sentiment_score REAL, topics TEXT,
-  red_flag INTEGER DEFAULT 0, created_at REAL);
-CREATE INDEX IF NOT EXISTS ix_msg_user ON messages(user_id, id);
-CREATE TABLE IF NOT EXISTS escalations (
-  id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT, channel TEXT, reason TEXT, kind TEXT,
-  status TEXT DEFAULT 'open', created_at REAL);
-CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT);
-CREATE TABLE IF NOT EXISTS employees (
-  id INTEGER PRIMARY KEY AUTOINCREMENT, code TEXT UNIQUE, name TEXT, site TEXT, is_office INTEGER DEFAULT 1,
-  hire_date TEXT, probation_end TEXT, recruiter_ok INTEGER DEFAULT 0, form TEXT, user_id TEXT, channel TEXT,
-  state TEXT DEFAULT '{}', active INTEGER DEFAULT 1, created_at REAL);
-CREATE TABLE IF NOT EXISTS manager_notices (
-  id INTEGER PRIMARY KEY AUTOINCREMENT, employee_id INTEGER, kind TEXT, text TEXT, manager TEXT, delivered INTEGER DEFAULT 0,
-  created_at REAL, UNIQUE(employee_id, kind));
-CREATE TABLE IF NOT EXISTS sent_steps (
-  employee_id INTEGER, step_id TEXT, status TEXT, at REAL, PRIMARY KEY (employee_id, step_id));
-CREATE TABLE IF NOT EXISTS survey_answers (
-  id INTEGER PRIMARY KEY AUTOINCREMENT, employee_id INTEGER, survey TEXT, qkey TEXT, qtype TEXT,
-  value TEXT, label TEXT, comment TEXT, created_at REAL);
-CREATE TABLE IF NOT EXISTS bot_commands (name TEXT PRIMARY KEY, description TEXT, kind TEXT, reply TEXT, query TEXT,
-  fallback TEXT, builtin INTEGER DEFAULT 0, sort INTEGER DEFAULT 0, updated_at REAL);
-CREATE TABLE IF NOT EXISTS rewrites (key TEXT PRIMARY KEY, text TEXT);
-CREATE TABLE IF NOT EXISTS users (user_id TEXT PRIMARY KEY, name TEXT, channel TEXT, created_at REAL);
-"""
+from . import pg
 
 
 @contextmanager
 def conn():
-    Path(config.data_dir()).mkdir(parents=True, exist_ok=True)
-    c = sqlite3.connect(str(Path(config.data_dir()) / "pipeline.db"))
-    c.row_factory = sqlite3.Row
-    c.executescript(SCHEMA)
-    cols = {r["name"] for r in c.execute("PRAGMA table_info(messages)")}
-    for col, ddl in (("kind", "TEXT"), ("buttons", "TEXT"), ("image", "TEXT")):  # миграция: proactive-сообщения и кнопки
-        if col not in cols:
-            c.execute(f"ALTER TABLE messages ADD COLUMN {col} {ddl}")
-    ecols = {r["name"] for r in c.execute("PRAGMA table_info(employees)")}
-    for col in ("manager", "manager_user"):  # руководитель подразделения и его чат для push-уведомлений
-        if col not in ecols:
-            c.execute(f"ALTER TABLE employees ADD COLUMN {col} TEXT")
-    try:
+    """Соединение с PostgreSQL (схема pipeline); commit при успехе, rollback при ошибке."""
+    with pg.conn() as c:
         yield c
-        c.commit()
-    finally:
-        c.close()
+
+
+def _one(c, sql: str, args=()):
+    """Первое значение первой строки (COUNT и т. п.)."""
+    return next(iter(c.execute(sql, args).fetchone().values()))
 
 
 def get_setting(key: str, default: str | None = None) -> str | None:
     with conn() as c:
-        r = c.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+        r = c.execute("SELECT value FROM settings WHERE key=%s", (key,)).fetchone()
         return r["value"] if r else default
 
 
 def set_setting(key: str, value: str) -> None:
     with conn() as c:
-        c.execute("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value))
+        c.execute("INSERT INTO settings(key,value) VALUES(%s,%s) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value))
 
 
 def add_message(user_id, channel, role, text, sources=None, grounded=None, kind=None, buttons=None, image=None) -> int:
     with conn() as c:
         cur = c.execute(
-            "INSERT INTO messages(user_id,channel,role,text,sources,grounded,created_at,kind,buttons,image) VALUES(?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO messages(user_id,channel,role,text,sources,grounded,created_at,kind,buttons,image) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
             (user_id, channel, role, text, json.dumps(sources or [], ensure_ascii=False),
              None if grounded is None else int(grounded), time.time(), kind,
              json.dumps(buttons, ensure_ascii=False) if buttons else None, image),
         )
-        return cur.lastrowid
+        return cur.fetchone()["id"]
 
 
 def set_sentiment(msg_id: int, sentiment: str, score: float, topics: list[str], red_flag: bool) -> None:
     with conn() as c:
         c.execute(
-            "UPDATE messages SET sentiment=?, sentiment_score=?, topics=?, red_flag=? WHERE id=?",
+            "UPDATE messages SET sentiment=%s, sentiment_score=%s, topics=%s, red_flag=%s WHERE id=%s",
             (sentiment, score, json.dumps(topics, ensure_ascii=False), int(red_flag), msg_id),
         )
 
 
 def history(user_id: str, limit: int = 10) -> list[dict]:
     with conn() as c:
-        rows = c.execute("SELECT id, role, text, channel, kind, buttons, image, created_at FROM messages WHERE user_id=? "
-                         "ORDER BY id DESC LIMIT ?", (user_id, limit)).fetchall()
+        rows = c.execute("SELECT id, role, text, channel, kind, buttons, image, created_at FROM messages WHERE user_id=%s "
+                         "ORDER BY id DESC LIMIT %s", (user_id, limit)).fetchall()
     out = [dict(r) for r in reversed(rows)]
     for m in out:
         m["buttons"] = json.loads(m["buttons"]) if m["buttons"] else None
@@ -98,22 +59,35 @@ def history(user_id: str, limit: int = 10) -> list[dict]:
 
 def get_escalation(esc_id: int) -> dict | None:
     with conn() as c:
-        r = c.execute(ESC_SELECT + " WHERE e.id=?", (esc_id,)).fetchone()
+        r = c.execute(ESC_SELECT + " WHERE e.id=%s", (esc_id,)).fetchone()
         return _esc(r) if r else None
 
 
-def add_escalation(user_id, channel, reason, kind) -> int:
+MERGE_WINDOW = 24 * 3600                                      # повторы за сутки склеиваются в одно обращение
+MERGE_KINDS = ("unanswered", "sentiment", "agent", "intent")   # автоматические обращения; явные просьбы и опросы — отдельные
+
+
+def add_escalation(user_id, channel, reason, kind, merge: bool | None = None) -> int:
+    """Создаёт обращение для HR. Автоматические обращения (нет ответа в базе, красный флаг, решение модели, интент): если у
+    сотрудника уже есть незакрытое обращение того же вида за последние сутки, новая причина дописывается в него
+    (счётчик повторов растёт) — HR не получает поток дублей. Явные просьбы и сигналы из опросов создаются отдельно."""
+    now = time.time()
     with conn() as c:
-        return c.execute(
-            "INSERT INTO escalations(user_id,channel,reason,kind,created_at) VALUES(?,?,?,?,?)",
-            (user_id, channel, reason, kind, time.time()),
-        ).lastrowid
+        if kind in MERGE_KINDS if merge is None else merge:
+            row = c.execute("SELECT id, reason FROM escalations WHERE user_id=%s AND kind=%s AND status<>'resolved' AND created_at>=%s "
+                            "ORDER BY id DESC LIMIT 1 FOR UPDATE", (user_id, kind, now - MERGE_WINDOW)).fetchone()
+            if row:
+                merged = row["reason"] if reason in (row["reason"] or "") else f"{row['reason']}\n{reason}"[:3000]
+                c.execute("UPDATE escalations SET reason=%s, repeats=repeats+1, updated_at=%s WHERE id=%s", (merged, now, row["id"]))
+                return row["id"]
+        return c.execute("INSERT INTO escalations(user_id,channel,reason,kind,created_at,updated_at) VALUES(%s,%s,%s,%s,%s,%s) RETURNING id",
+                         (user_id, channel, reason, kind, now, now)).fetchone()["id"]
 
 
 def upsert_user(user_id: str, name: str | None, channel: str) -> None:
     with conn() as c:
         c.execute(
-            "INSERT INTO users(user_id,name,channel,created_at) VALUES(?,?,?,?) "
+            "INSERT INTO users(user_id,name,channel,created_at) VALUES(%s,%s,%s,%s) "
             "ON CONFLICT(user_id) DO UPDATE SET name=COALESCE(NULLIF(excluded.name,''), users.name)",
             (user_id, (name or "").strip()[:80], channel, time.time()),
         )
@@ -121,7 +95,7 @@ def upsert_user(user_id: str, name: str | None, channel: str) -> None:
 
 def get_user(user_id: str) -> dict | None:
     with conn() as c:
-        r = c.execute("SELECT * FROM users WHERE user_id=?", (user_id,)).fetchone()
+        r = c.execute("SELECT * FROM users WHERE user_id=%s", (user_id,)).fetchone()
         return dict(r) if r else None
 
 
@@ -129,14 +103,14 @@ def list_users(channel: str | None = None) -> list[dict]:
     with conn() as c:
         q, a = "SELECT * FROM users", ()
         if channel:
-            q, a = q + " WHERE channel=?", (channel,)
+            q, a = q + " WHERE channel=%s", (channel,)
         return [dict(r) for r in c.execute(q + " ORDER BY created_at", a)]
 
 
 ESC_SELECT = (
     "SELECT e.*, (SELECT emp.name FROM employees emp WHERE emp.user_id=e.user_id ORDER BY emp.id DESC LIMIT 1) AS name, "
-    "(SELECT json_object('t', m.text, 's', m.sentiment, 'r', m.red_flag) FROM messages m WHERE m.user_id=e.user_id AND m.role='user' "
-    "AND m.text NOT LIKE '[кнопка]%' AND m.created_at <= e.created_at + 1 ORDER BY m.id DESC LIMIT 1) AS last_msg, "
+    "(SELECT json_build_object('t', m.text, 's', m.sentiment, 'r', m.red_flag)::text FROM messages m WHERE m.user_id=e.user_id AND m.role='user' "
+    "AND NOT starts_with(m.text, '[кнопка]') AND m.created_at <= e.created_at + 1 ORDER BY m.id DESC LIMIT 1) AS last_msg, "
     "(SELECT emp.site FROM employees emp WHERE emp.user_id=e.user_id ORDER BY emp.id DESC LIMIT 1) AS site "
     "FROM escalations e")
 
@@ -155,13 +129,13 @@ def list_escalations(status: str | None = None) -> list[dict]:
     with conn() as c:
         q, a = ESC_SELECT, ()
         if status:
-            q, a = q + " WHERE e.status=?", (status,)
+            q, a = q + " WHERE e.status=%s", (status,)
         return [_esc(r) for r in c.execute(q + " ORDER BY e.id DESC LIMIT 200", a)]
 
 
 def set_escalation_status(esc_id: int, status: str) -> bool:
     with conn() as c:
-        return c.execute("UPDATE escalations SET status=? WHERE id=?", (status, esc_id)).rowcount > 0
+        return c.execute("UPDATE escalations SET status=%s WHERE id=%s", (status, esc_id)).rowcount > 0
 
 
 def scope(days: int | None = None, site: str | None = None, manager: str | None = None, alias: str = "") -> tuple[str, list]:
@@ -169,14 +143,14 @@ def scope(days: int | None = None, site: str | None = None, manager: str | None 
     p = f"{alias}." if alias else ""
     where, args = [], []
     if days:
-        where.append(f"{p}created_at >= ?")
+        where.append(f"{p}created_at >= %s")
         args.append(time.time() - days * 86400)
     if site or manager:
         sub, sa = "SELECT user_id FROM employees WHERE user_id IS NOT NULL", []
         if site:
-            sub, sa = sub + " AND site=?", sa + [site]
+            sub, sa = sub + " AND site=%s", sa + [site]
         if manager:
-            sub, sa = sub + " AND manager=?", sa + [manager]
+            sub, sa = sub + " AND manager=%s", sa + [manager]
         where.append(f"{p}user_id IN ({sub})")
         args += sa
     return (" AND " + " AND ".join(where)) if where else "", args
@@ -186,12 +160,27 @@ def msg_filter(topic: str | None = None, sentiment: str | None = None) -> tuple[
     """Условие для сообщений сотрудников по теме и тональности. «Нейтрально» включает позитивные: отдельного «позитива» в аналитике нет."""
     sql, args = "", []
     if topic:
-        sql, args = sql + " AND topics LIKE ?", args + [f'%"{topic}"%']
+        sql, args = sql + " AND topics LIKE %s", args + [f'%"{topic}"%']
     if sentiment == "negative":
         sql += " AND sentiment='negative'"
     elif sentiment in ("neutral", "positive"):
         sql += " AND sentiment IN ('neutral','positive')"
     return sql, args
+
+
+# В общую статистику входят только сообщения сотрудников с оценкой тональности: нажатия кнопок, «/»-команды и короткие
+# ответы опросов («9», «да») оценки не получают и вопросами к боту не считаются.
+SCORED = "role='user' AND sentiment IS NOT NULL"
+
+
+HR_QUESTION_KINDS = ("unanswered", "agent", "intent", "forward", "contact", "command")   # обращения, где вопрос ушёл к человеку
+
+
+def handled_without_hr(answered: int, esc_kinds: dict) -> dict:
+    """Сколько вопросов бот закрыл сам (ответ по базе знаний) и сколько передал HR; доля — «закрыто без HR»."""
+    handed = sum(esc_kinds.get(k, 0) for k in HR_QUESTION_KINDS)
+    total = answered + handed
+    return {"answered": answered, "handed_over": handed, "share": round(answered / total, 3) if total else None}
 
 
 def analytics(days: int | None = None, site: str | None = None, manager: str | None = None,
@@ -200,12 +189,12 @@ def analytics(days: int | None = None, site: str | None = None, manager: str | N
     mf, ma = msg_filter(topic, sentiment)
     uflt, ufa = flt + mf, fa + ma                      # условие для сообщений сотрудников (с темой и тональностью)
     with conn() as c:
-        one = lambda q, a=(): c.execute(q, a).fetchone()[0]  # noqa: E731
-        user_msgs = one("SELECT COUNT(*) FROM messages WHERE role='user' AND text NOT LIKE '[кнопка]%'" + uflt, ufa)  # нажатия кнопок — не вопросы
+        one = lambda q, a=(): _one(c, q, a)  # noqa: E731
+        user_msgs = one(f"SELECT COUNT(*) FROM messages WHERE {SCORED}" + uflt, ufa)
         bot_msgs = one("SELECT COUNT(*) FROM messages WHERE role='assistant'" + flt, fa)
         grounded = one("SELECT COUNT(*) FROM messages WHERE role='assistant' AND grounded=1" + flt, fa)
         sentiments: dict[str, int] = {}
-        for r in c.execute("SELECT sentiment, COUNT(*) n FROM messages WHERE role='user' AND sentiment IS NOT NULL" + uflt + " GROUP BY sentiment", ufa):
+        for r in c.execute("SELECT sentiment, COUNT(*) AS n FROM messages WHERE role='user' AND sentiment IS NOT NULL" + uflt + " GROUP BY sentiment", ufa):
             key = "neutral" if r["sentiment"] == "positive" else r["sentiment"]      # позитив учитывается как нейтральное
             sentiments[key] = sentiments.get(key, 0) + r["n"]
         topic_counts: dict[str, dict] = {}
@@ -215,10 +204,12 @@ def analytics(days: int | None = None, site: str | None = None, manager: str | N
                 d["n"] += 1
                 d["neg"] += r["sentiment"] == "negative"
         daily = [dict(r) for r in c.execute(
-            "SELECT date(created_at,'unixepoch') day, COUNT(*) n, "
-            "SUM(sentiment='negative') neg, SUM(sentiment IN ('neutral','positive')) neu, "
-            "ROUND(AVG(sentiment_score),2) avg FROM messages WHERE role='user' AND text NOT LIKE '[кнопка]%'" + uflt +
+            "SELECT to_char(to_timestamp(created_at) AT TIME ZONE 'UTC', 'YYYY-MM-DD') AS day, COUNT(*) AS n, "
+            "SUM((sentiment='negative')::int) AS neg, SUM((sentiment IN ('neutral','positive'))::int) AS neu, "
+            f"ROUND(AVG(sentiment_score)::numeric, 2) AS avg FROM messages WHERE {SCORED}" + uflt +
             " GROUP BY day ORDER BY day DESC LIMIT 60", ufa)]
+        for d in daily:
+            d["avg"] = None if d["avg"] is None else float(d["avg"])
         flags = [dict(r) for r in c.execute(
             "SELECT id,user_id,(SELECT emp.name FROM employees emp WHERE emp.user_id=messages.user_id ORDER BY emp.id DESC LIMIT 1) AS name,text,sentiment,topics,created_at "
             "FROM messages WHERE red_flag=1" + uflt + " ORDER BY id DESC LIMIT 20", ufa)]
@@ -226,10 +217,10 @@ def analytics(days: int | None = None, site: str | None = None, manager: str | N
             f["topics"] = json.loads(f["topics"] or "[]")
         eflt, ea = scope(days, site, manager, "e")
         esc = {r["status"]: r["n"] for r in c.execute(
-            "SELECT e.status, COUNT(*) n FROM escalations e WHERE 1=1" + eflt + " GROUP BY e.status", ea)}
+            "SELECT e.status, COUNT(*) AS n FROM escalations e WHERE 1=1" + eflt + " GROUP BY e.status", ea)}
         esc_kinds = {r["kind"]: r["n"] for r in c.execute(
-            "SELECT e.kind, COUNT(*) n FROM escalations e WHERE 1=1" + eflt + " GROUP BY e.kind", ea)}
-        users = one("SELECT COUNT(DISTINCT user_id) FROM messages WHERE role='user'" + uflt, ufa)
+            "SELECT e.kind, COUNT(*) AS n FROM escalations e WHERE 1=1" + eflt + " GROUP BY e.kind", ea)}
+        users = one(f"SELECT COUNT(DISTINCT user_id) FROM messages WHERE {SCORED}" + uflt, ufa)
     return {
         "users": users,
         "user_messages": user_msgs,
@@ -244,6 +235,7 @@ def analytics(days: int | None = None, site: str | None = None, manager: str | N
         "red_flags": flags,
         "escalations": esc,
         "escalation_kinds": esc_kinds,
+        "handled": handled_without_hr(grounded, esc_kinds),
         "filters": {"days": days, "site": site, "manager": manager, "topic": topic, "sentiment": sentiment},
     }
 
@@ -253,20 +245,20 @@ def messages_drill(days=None, site=None, manager=None, topic=None, sentiment=Non
     """Сообщения сотрудников для детализации диаграмм (клик по теме, тональности, дню, красным флагам)."""
     flt, fa = scope(days, site, manager)
     q = ("SELECT id,user_id,(SELECT emp.name FROM employees emp WHERE emp.user_id=messages.user_id ORDER BY emp.id DESC LIMIT 1) AS name,text,sentiment,sentiment_score,topics,"
-         "red_flag,created_at FROM messages WHERE role='user' AND text NOT LIKE '[кнопка]%'" + flt)
+         f"red_flag,created_at FROM messages WHERE {SCORED}" + flt)
     if sentiment:
         sf, sa = msg_filter(None, sentiment)
         q, fa = q + sf, fa + sa
     if red_flag:
         q += " AND red_flag=1"
     if day:
-        q, fa = q + " AND date(created_at,'unixepoch')=?", fa + [day]
+        q, fa = q + " AND to_char(to_timestamp(created_at) AT TIME ZONE 'UTC', 'YYYY-MM-DD')=%s", fa + [day]
     if user_id:
-        q, fa = q + " AND user_id=?", fa + [user_id]
+        q, fa = q + " AND user_id=%s", fa + [user_id]
     if topic:
-        q, fa = q + " AND topics LIKE ?", fa + [f'%"{topic}"%']
+        q, fa = q + " AND topics LIKE %s", fa + [f'%"{topic}"%']
     with conn() as c:
-        rows = [dict(r) for r in c.execute(q + " ORDER BY id DESC LIMIT ?", fa + [limit])]
+        rows = [dict(r) for r in c.execute(q + " ORDER BY id DESC LIMIT %s", fa + [limit])]
     for r in rows:
         r["topics"] = json.loads(r["topics"] or "[]")
         r["red_flag"] = bool(r["red_flag"])
@@ -282,10 +274,10 @@ def create_employee(**f) -> int:
     with conn() as c:
         return c.execute(
             "INSERT INTO employees(code,name,site,is_office,hire_date,probation_end,recruiter_ok,created_at,manager,manager_user) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?)",
+            "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
             (f["code"], f["name"], f["site"], int(f.get("is_office", True)), f["hire_date"], f.get("probation_end") or None,
              int(f.get("recruiter_ok", False)), time.time(), f.get("manager") or None, f.get("manager_user") or None),
-        ).lastrowid
+        ).fetchone()["id"]
 
 
 def _emp(r) -> dict:
@@ -298,19 +290,19 @@ def _emp(r) -> dict:
 
 def get_employee(emp_id: int) -> dict | None:
     with conn() as c:
-        r = c.execute("SELECT * FROM employees WHERE id=?", (emp_id,)).fetchone()
+        r = c.execute("SELECT * FROM employees WHERE id=%s", (emp_id,)).fetchone()
         return _emp(r) if r else None
 
 
 def employee_by_code(code: str) -> dict | None:
     with conn() as c:
-        r = c.execute("SELECT * FROM employees WHERE code=? COLLATE NOCASE", (code.strip(),)).fetchone()
+        r = c.execute("SELECT * FROM employees WHERE lower(code)=lower(%s)", (code.strip(),)).fetchone()
         return _emp(r) if r else None
 
 
 def employee_by_user(user_id: str) -> dict | None:
     with conn() as c:
-        r = c.execute("SELECT * FROM employees WHERE user_id=? AND active=1 ORDER BY id DESC LIMIT 1", (user_id,)).fetchone()
+        r = c.execute("SELECT * FROM employees WHERE user_id=%s AND active=1 ORDER BY id DESC LIMIT 1", (user_id,)).fetchone()
         return _emp(r) if r else None
 
 
@@ -320,60 +312,104 @@ def list_employees(only_bound_active: bool = False) -> list[dict]:
         return [_emp(r) for r in c.execute(q)]
 
 
+EMPLOYEE_COLUMNS = {"code", "name", "site", "is_office", "hire_date", "probation_end", "recruiter_ok", "form", "user_id", "channel",
+                    "state", "active", "manager", "manager_user"}
+
+
 def update_employee(emp_id: int, **fields) -> None:
+    unknown = set(fields) - EMPLOYEE_COLUMNS
+    if unknown:  # имена колонок попадают в SQL — только из белого списка
+        raise ValueError(f"неизвестные поля сотрудника: {sorted(unknown)}")
     if "state" in fields:
         fields["state"] = json.dumps(fields["state"], ensure_ascii=False)
     for k in ("is_office", "recruiter_ok", "active"):
         if k in fields:
             fields[k] = int(fields[k])
-    cols = ", ".join(f"{k}=?" for k in fields)
+    cols = ", ".join(f"{k}=%s" for k in fields)
     with conn() as c:
-        c.execute(f"UPDATE employees SET {cols} WHERE id=?", (*fields.values(), emp_id))
+        c.execute(f"UPDATE employees SET {cols} WHERE id=%s", (*fields.values(), emp_id))
 
 
 def delete_employee(emp_id: int) -> None:
     with conn() as c:
         for t, col in (("sent_steps", "employee_id"), ("survey_answers", "employee_id"), ("employees", "id")):
-            c.execute(f"DELETE FROM {t} WHERE {col}=?", (emp_id,))
+            c.execute(f"DELETE FROM {t} WHERE {col}=%s", (emp_id,))
 
 
 def step_status(emp_id: int) -> dict[str, dict]:
     with conn() as c:
         return {r["step_id"]: {"status": r["status"], "at": r["at"]} for r in
-                c.execute("SELECT * FROM sent_steps WHERE employee_id=?", (emp_id,))}
+                c.execute("SELECT * FROM sent_steps WHERE employee_id=%s", (emp_id,))}
+
+
+def step_statuses(emp_ids: list[int] | None = None) -> dict[int, dict[str, dict]]:
+    """Статусы этапов сразу по многим сотрудникам одним запросом: {employee_id: {step_id: {status, at}}}."""
+    with conn() as c:
+        rows = (c.execute("SELECT * FROM sent_steps WHERE employee_id = ANY(%s)", (emp_ids,)) if emp_ids is not None
+                else c.execute("SELECT * FROM sent_steps"))
+        out: dict[int, dict[str, dict]] = {}
+        for r in rows:
+            out.setdefault(r["employee_id"], {})[r["step_id"]] = {"status": r["status"], "at": r["at"]}
+    return out
+
+
+RISK_ESCALATION_KINDS = ("survey", "sentiment", "contact", "agent", "intent", "forward")   # обращения, повышающие риск ухода
+MSGS_PER_USER = 500
+
+
+def risk_inputs(user_ids: list[str], emp_ids: list[int], days: int | None = None) -> dict:
+    """Всё, что нужно индексу риска, — четырьмя запросами на всех сотрудников сразу (а не по запросу на каждого)."""
+    since = time.time() - days * 86400 if days else 0
+    with conn() as c:
+        msgs: dict[str, list[dict]] = {}
+        for r in c.execute(
+                "SELECT user_id, sentiment, sentiment_score, topics, red_flag FROM ("
+                "  SELECT *, row_number() OVER (PARTITION BY user_id ORDER BY id DESC) AS rn FROM messages "
+                "  WHERE role='user' AND sentiment IS NOT NULL AND user_id = ANY(%s) AND created_at >= %s) t "
+                "WHERE rn <= %s ORDER BY user_id, rn", (user_ids, since, MSGS_PER_USER)):
+            msgs.setdefault(r["user_id"], []).append({**r, "topics": json.loads(r["topics"] or "[]"), "red_flag": bool(r["red_flag"])})
+        scale: dict[int, list[str]] = {}
+        for r in c.execute("SELECT employee_id, value FROM survey_answers WHERE qtype='scale' AND employee_id = ANY(%s) ORDER BY id", (emp_ids,)):
+            scale.setdefault(r["employee_id"], []).append(r["value"])
+        open_esc = {r["user_id"]: r["n"] for r in c.execute(
+            "SELECT user_id, COUNT(*) AS n FROM escalations WHERE status<>'resolved' AND kind = ANY(%s) AND user_id = ANY(%s) GROUP BY user_id",
+            (list(RISK_ESCALATION_KINDS), user_ids))}
+        last = {r["user_id"]: r["ts"] for r in c.execute(
+            "SELECT user_id, MAX(created_at) AS ts FROM messages WHERE user_id = ANY(%s) GROUP BY user_id", (user_ids,))}
+    return {"msgs": msgs, "scale": scale, "open_esc": open_esc, "last": last}
 
 
 def mark_step(emp_id: int, step_id: str, status: str) -> None:
     with conn() as c:
-        c.execute("INSERT INTO sent_steps(employee_id,step_id,status,at) VALUES(?,?,?,?) "
+        c.execute("INSERT INTO sent_steps(employee_id,step_id,status,at) VALUES(%s,%s,%s,%s) "
                   "ON CONFLICT(employee_id,step_id) DO UPDATE SET status=excluded.status, at=excluded.at",
                   (emp_id, step_id, status, time.time()))
 
 
 def reset_employee_progress(emp_id: int) -> None:
     with conn() as c:
-        c.execute("DELETE FROM sent_steps WHERE employee_id=?", (emp_id,))
-        c.execute("DELETE FROM survey_answers WHERE employee_id=?", (emp_id,))
-        c.execute("UPDATE employees SET state='{}', form=NULL WHERE id=?", (emp_id,))
+        c.execute("DELETE FROM sent_steps WHERE employee_id=%s", (emp_id,))
+        c.execute("DELETE FROM survey_answers WHERE employee_id=%s", (emp_id,))
+        c.execute("UPDATE employees SET state='{}', form=NULL WHERE id=%s", (emp_id,))
 
 
 def add_answer(emp_id: int, survey: str, qkey: str, qtype: str, value, label=None, comment=None) -> None:
     with conn() as c:
-        c.execute("INSERT INTO survey_answers(employee_id,survey,qkey,qtype,value,label,comment,created_at) VALUES(?,?,?,?,?,?,?,?)",
+        c.execute("INSERT INTO survey_answers(employee_id,survey,qkey,qtype,value,label,comment,created_at) VALUES(%s,%s,%s,%s,%s,%s,%s,%s)",
                   (emp_id, survey, qkey, qtype, str(value), label, comment, time.time()))
 
 
 def attach_comment(emp_id: int, survey: str, qkey: str, comment: str) -> None:
     with conn() as c:
-        c.execute("UPDATE survey_answers SET comment=? WHERE id=(SELECT MAX(id) FROM survey_answers "
-                  "WHERE employee_id=? AND survey=? AND qkey=?)", (comment, emp_id, survey, qkey))
+        c.execute("UPDATE survey_answers SET comment=%s WHERE id=(SELECT MAX(id) FROM survey_answers "
+                  "WHERE employee_id=%s AND survey=%s AND qkey=%s)", (comment, emp_id, survey, qkey))
 
 
 def list_answers(emp_id: int | None = None) -> list[dict]:
     with conn() as c:
         q, a = "SELECT * FROM survey_answers", ()
         if emp_id is not None:
-            q, a = q + " WHERE employee_id=?", (emp_id,)
+            q, a = q + " WHERE employee_id=%s", (emp_id,)
         return [dict(r) for r in c.execute(q + " ORDER BY id", a)]
 
 
@@ -397,13 +433,13 @@ def survey_stats() -> list[dict]:
 
 def get_rewrite(key: str) -> str | None:
     with conn() as c:
-        r = c.execute("SELECT text FROM rewrites WHERE key=?", (key,)).fetchone()
+        r = c.execute("SELECT text FROM rewrites WHERE key=%s", (key,)).fetchone()
         return r["text"] if r else None
 
 
 def set_rewrite(key: str, text: str) -> None:
     with conn() as c:
-        c.execute("INSERT OR REPLACE INTO rewrites(key,text) VALUES(?,?)", (key, text))
+        c.execute("INSERT INTO rewrites(key,text) VALUES(%s,%s) ON CONFLICT(key) DO UPDATE SET text=excluded.text", (key, text))
 
 
 # ---------- команды бота (редактируются в панели управления) ----------
@@ -414,7 +450,7 @@ def list_commands() -> list[dict]:
 
 def get_command(name: str) -> dict | None:
     with conn() as c:
-        r = c.execute("SELECT * FROM bot_commands WHERE name=?", (name,)).fetchone()
+        r = c.execute("SELECT * FROM bot_commands WHERE name=%s", (name,)).fetchone()
         return (dict(r) | {"builtin": bool(r["builtin"])}) if r else None
 
 
@@ -422,30 +458,73 @@ def save_command(name: str, **f) -> None:
     cur = get_command(name) or {"description": "", "kind": "static", "reply": "", "query": "", "fallback": "", "builtin": False, "sort": 0}
     row = {**cur, **f}
     with conn() as c:
-        c.execute("INSERT OR REPLACE INTO bot_commands(name,description,kind,reply,query,fallback,builtin,sort,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
+        c.execute("INSERT INTO bot_commands(name,description,kind,reply,query,fallback,builtin,sort,updated_at) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s) "
+                  "ON CONFLICT(name) DO UPDATE SET description=excluded.description, kind=excluded.kind, reply=excluded.reply, query=excluded.query, "
+                  "fallback=excluded.fallback, builtin=excluded.builtin, sort=excluded.sort, updated_at=excluded.updated_at",
                   (name, row["description"], row["kind"], row["reply"], row["query"], row["fallback"], int(row["builtin"]), row["sort"], time.time()))
 
 
 def delete_command(name: str) -> None:
     with conn() as c:
-        c.execute("DELETE FROM bot_commands WHERE name=?", (name,))
+        c.execute("DELETE FROM bot_commands WHERE name=%s", (name,))
 
 
 # ---------- уведомления руководителям подразделений ----------
 def add_notice(emp_id: int, kind: str, text: str, manager: str | None) -> bool:
     """True — уведомление новое (повтор того же вида для сотрудника не создаётся)."""
     with conn() as c:
-        return c.execute("INSERT OR IGNORE INTO manager_notices(employee_id,kind,text,manager,created_at) VALUES(?,?,?,?,?)",
+        return c.execute("INSERT INTO manager_notices(employee_id,kind,text,manager,created_at) VALUES(%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING",
                          (emp_id, kind, text, manager, time.time())).rowcount > 0
 
 
 def mark_notice_delivered(emp_id: int, kind: str) -> None:
     with conn() as c:
-        c.execute("UPDATE manager_notices SET delivered=1 WHERE employee_id=? AND kind=?", (emp_id, kind))
+        c.execute("UPDATE manager_notices SET delivered=1 WHERE employee_id=%s AND kind=%s", (emp_id, kind))
 
 
 def list_notices(manager: str | None = None, limit: int = 100) -> list[dict]:
     with conn() as c:
         q = ("SELECT n.*, e.name AS employee FROM manager_notices n JOIN employees e ON e.id=n.employee_id"
-             + (" WHERE n.manager=?" if manager else "") + " ORDER BY n.id DESC LIMIT ?")
+             + (" WHERE n.manager=%s" if manager else "") + " ORDER BY n.id DESC LIMIT %s")
         return [dict(r) for r in c.execute(q, ([manager] if manager else []) + [limit])]
+
+
+# ---------- входящие события МАКС: «в работе» до успешной обработки, чтобы не терять их при сбое или перезапуске ----------
+def inbox_add(user_id: str | None, payload: str) -> int:
+    now = time.time()
+    with conn() as c:
+        return c.execute("INSERT INTO inbox(user_id,payload,created_at,updated_at) VALUES(%s,%s,%s,%s) RETURNING id",
+                         (user_id, payload, now, now)).fetchone()["id"]
+
+
+def inbox_done(event_id: int) -> None:
+    with conn() as c:
+        c.execute("DELETE FROM inbox WHERE id=%s", (event_id,))
+
+
+def inbox_fail(event_id: int, error: str) -> None:
+    with conn() as c:
+        c.execute("UPDATE inbox SET status='failed', error=%s, updated_at=%s WHERE id=%s", (error[:500], time.time(), event_id))
+
+
+def inbox_pending() -> list[dict]:
+    """События, которые начали обрабатываться, но не закончили (процесс остановился)."""
+    with conn() as c:
+        return [dict(r) for r in c.execute("SELECT * FROM inbox WHERE status='processing' ORDER BY id")]
+
+
+def inbox_retry(event_id: int) -> int:
+    """Отмечает новую попытку, возвращает её номер."""
+    with conn() as c:
+        return c.execute("UPDATE inbox SET attempts=attempts+1, updated_at=%s WHERE id=%s RETURNING attempts",
+                         (time.time(), event_id)).fetchone()["attempts"]
+
+
+def inbox_counts() -> dict:
+    with conn() as c:
+        return {r["status"]: r["n"] for r in c.execute("SELECT status, COUNT(*) AS n FROM inbox GROUP BY status")}
+
+
+def list_failed_events(limit: int = 50) -> list[dict]:
+    with conn() as c:
+        return [dict(r) for r in c.execute("SELECT * FROM inbox WHERE status='failed' ORDER BY id DESC LIMIT %s", (limit,))]

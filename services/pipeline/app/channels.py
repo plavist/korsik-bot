@@ -1,5 +1,6 @@
 """Каналы доставки: web (ответ в HTTP) и MAX (Bot API: long polling / webhook)."""
 import asyncio
+import contextlib
 
 import httpx
 
@@ -150,10 +151,8 @@ async def delete_pressed_message(message_id: str | None) -> bool:
 
 async def answer_callback(callback_id: str) -> None:
     """Подтверждаем нажатие кнопки (иначе у пользователя «крутится» индикатор). Сбой не критичен."""
-    try:
+    with contextlib.suppress(Exception):
         await max_request("POST", "/answers", params={"callback_id": callback_id}, json={})
-    except Exception:  # noqa: BLE001
-        pass
 
 
 async def register_commands() -> dict:

@@ -9,7 +9,8 @@ from app import channels, config, db, max_poller
 from app.main import app, process_max
 from helpers import GW, ING, SENT_JSON, hit, llm_reply, tool_call
 
-anon = TestClient(app)  # публичные маршруты (веб-чат, внешний мир)
+anon = TestClient(app, headers={"X-Max-Bot-Api-Secret": "test-secret"})  # публичные маршруты; секрет вебхука подставляется сам
+bare = TestClient(app)  # тот же сервер, но без секрета
 client = TestClient(app, headers={"X-Internal-Token": config.internal_token()})  # как сервис admin
 
 
@@ -50,15 +51,13 @@ def test_chat_as_different_users_isolated_history_and_names():
     a, b = web_user("Анна"), web_user("Борис")
     r = anon.post("/api/chat", json={"user_id": a, "message": "Во сколько работаем?"})
     assert r.status_code == 200 and r.json()["grounded"] and r.json()["sources"][0]["title"] == "ПВТР"
-    anon.post("/api/chat", json={"user_id": b, "message": "/HR"})
-    assert client.get("/api/escalations").json() == []                      # /HR только предлагает — HR пока ничего не получил
-    anon.post("/api/chat", json={"user_id": b, "payload": "hr:send"})       # «Передать HR»
+    anon.post("/api/chat", json={"user_id": b, "message": "/HR"})          # передаётся HR сразу
     assert [m["role"] for m in anon.get(f"/api/history/{a}").json()] == ["user", "assistant"]
     assert "HR" in anon.get(f"/api/history/{b}").json()[0]["text"]
     esc = client.get("/api/escalations").json()[0]
     assert esc["name"] is None and esc["user_id"] == b
     an = client.get("/api/analytics").json()
-    assert an["user_messages"] == 2 and an["users"] == 2 and an["sentiments"] == {"neutral": 1}
+    assert an["user_messages"] == 1 and an["users"] == 1 and an["sentiments"] == {"neutral": 1}   # «/HR» и нажатие кнопки оценки не получают — в статистику не входят
 
 
 # ---------- права доступа ----------
@@ -77,13 +76,10 @@ def test_admin_routes_need_internal_token(method, path):
 def test_commands_hr_and_start():
     u = web_user()
     r = anon.post("/api/chat", json={"user_id": u, "message": "/HR"}).json()
-    assert "Передать HR" in str(r["messages"][0]["buttons"]) and "подтверждения" in r["reply"] and not r["escalated"]
-    assert client.get("/api/escalations").json() == []
-    r = anon.post("/api/chat", json={"user_id": u, "payload": "hr:send"}).json()
-    assert r["reply"].startswith("Передал!")
+    assert r["messages"][0]["buttons"] is None and r["reply"].startswith("Передал твой запрос")   # передано сразу, без подтверждения
     assert client.get("/api/escalations?status=open").json()[0]["kind"] == "command"
     r = anon.post("/api/chat", json={"user_id": u, "message": "/start"}).json()
-    assert "Корсик" in r["reply"] and not r["escalated"]
+    assert "Корсик" in r["reply"]
     assert client.get("/api/analytics").json()["sentiments"] == {}  # команды не идут в sentiment
 
 
@@ -186,7 +182,7 @@ def test_max_webhook_secret_and_send_failure(monkeypatch):
     monkeypatch.setenv("MAX_WEBHOOK_SECRET", "s3")
     monkeypatch.setenv("MAX_BOT_TOKEN", "tok")
     client.post("/api/mode", json={"mode": "max"})
-    assert anon.post("/max/webhook", json=msg_update()).status_code == 401
+    assert bare.post("/max/webhook", json=msg_update()).status_code == 401
     assert anon.post("/max/webhook", json=msg_update(), headers={"X-Max-Bot-Api-Secret": "bad"}).status_code == 401
     mock_llm_flow()
     respx.post("http://max/messages").mock(return_value=httpx.Response(500, text="err"))
@@ -292,4 +288,17 @@ async def test_register_on_start(monkeypatch):
 def test_help_command_and_all_commands_listed():
     u = web_user()
     r = anon.post("/api/chat", json={"user_id": u, "message": "/help"}).json()
-    assert all(f"/{n}" in r["reply"] for n in ("start", "hr", "help")) and not r["escalated"]
+    assert all(f"/{n}" in r["reply"] for n in ("start", "hr", "help"))
+
+
+@respx.mock
+def test_max_webhook_is_disabled_without_secret_and_subscribe_requires_it(monkeypatch):
+    monkeypatch.delenv("MAX_WEBHOOK_SECRET", raising=False)
+    monkeypatch.setenv("MAX_BOT_TOKEN", "tok")
+    client.post("/api/mode", json={"mode": "max"})
+    r = bare.post("/max/webhook", json=msg_update())
+    assert r.status_code == 503 and "MAX_WEBHOOK_SECRET" in r.json()["detail"]        # поддельные события не принимаем
+    assert db.history("42") == []
+    sub = respx.post("http://max/subscriptions").mock(return_value=httpx.Response(200, json={"success": True}))
+    r = client.post("/api/max/subscribe", json={"url": "https://bot.example/max/webhook"})
+    assert r.status_code == 400 and "MAX_WEBHOOK_SECRET" in r.json()["detail"] and not sub.called

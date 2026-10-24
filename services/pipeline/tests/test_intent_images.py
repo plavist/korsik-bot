@@ -29,23 +29,21 @@ def test_intent_ignores_regular_questions():
 
 
 @respx.mock
-async def test_escalation_like_question_gets_answer_plus_hr_proposal_without_sending():
+async def test_escalation_like_question_gets_answer_and_is_escalated_at_once():
     llm_router(kb_text="Такие вопросы решает HR.")
     res = await bot.handle("i1", "web", text="Меня обижает коллега, что делать?")
     m = res["messages"][0]
-    assert m["text"].endswith(intent.SUGGESTION) and [b["text"] for r in m["buttons"] for b in r] == ["Передать HR", "Не передавать"]
-    assert db.list_escalations() == []                                  # без нажатия ничего не уходит
-    await bot.handle("i1", "web", payload="hr:send")
-    esc = db.list_escalations()[0]
-    assert esc["kind"] == "intent" and "конфликт" in esc["reason"] and "обижает" in esc["reason"]
+    assert m["text"] == "Такие вопросы решает HR." and m["buttons"] is None   # ответ как обычно, без приписок и кнопок
+    esc = db.list_escalations()
+    assert len(esc) == 1 and esc[0]["kind"] == "intent" and "конфликт" in esc[0]["reason"] and "обижает" in esc[0]["reason"]
 
 
 @respx.mock
-async def test_intent_suggestion_uses_formal_form_for_vy():
+async def test_intent_escalation_for_formal_form_has_no_extra_text():
     llm_router(kb_text="Такие вопросы решает HR.")
     db.update_employee(make_emp(user="i2")["id"], form="vy")
     res = await bot.handle("i2", "web", text="Хочу уволиться")
-    assert res["messages"][0]["text"].endswith(intent.SUGGESTION_VY)
+    assert res["messages"][0]["text"] == "Такие вопросы решает HR." and db.list_escalations()[0]["kind"] == "intent"
 
 
 # ---------- картинки: ничего не поставляется заранее, всё через загрузку ----------

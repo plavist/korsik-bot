@@ -4,7 +4,34 @@ x-common: &common
   restart: unless-stopped
   env_file: [.env]
 
+# одна база PostgreSQL, у каждого сервиса своя схема (pipeline, ingest, admin, gateway)
+x-db: &db
+  DATABASE_URL: postgresql://korsik:${POSTGRES_PASSWORD:-korsik}@postgres:5432/korsik
+
 services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: korsik
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-korsik}
+      POSTGRES_DB: korsik
+    volumes: [postgres_data:/var/lib/postgresql/data]
+    ports: ["127.0.0.1:5432:5432"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U korsik -d korsik"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  # сервисы работают не от root: один раз выдаём им права на тома с файлами (картинки, загрузки, тексты документов)
+  volume-perms:
+    image: alpine:3.20
+    restart: "no"
+    user: "0:0"
+    command: ["sh", "-c", "chown -R 10001 /perm/ingest /perm/pipeline /perm/admin"]
+    volumes: [ingest_data:/perm/ingest, pipeline_data:/perm/pipeline, admin_data:/perm/admin]
+
   qdrant:
     image: qdrant/qdrant:latest
     restart: unless-stopped
@@ -15,16 +42,20 @@ services:
     <<: *common
     build: ./services/llm-gateway
     environment:
+      <<: *db
       LLM_PROVIDER: ${LLM_PROVIDER:-openrouter}
       LLM_MODEL: ${LLM_MODEL:-qwen/qwen3.8-27b}
       EMBED_PROVIDER: ${EMBED_PROVIDER:-openrouter}
       EMBED_MODEL: ${EMBED_MODEL:-qwen/qwen3-embedding-8b}
     ports: ["127.0.0.1:8001:8000"]
+    depends_on:
+      postgres: {condition: service_healthy}
 
   ingest:
     <<: *common
     build: ./services/ingest
     environment:
+      <<: *db
       GATEWAY_URL: http://llm-gateway:8000
       QDRANT_URL: http://qdrant:6333
       QDRANT_COLLECTION: ${QDRANT_COLLECTION:-polyplastic_kb}
@@ -33,23 +64,33 @@ services:
     # базовые документы (регламенты) — папка на сервере, путь задаётся BASE_DOCS_DIR в .env; при старте они попадают в базу знаний
     volumes: [ingest_data:/data, "${BASE_DOCS_DIR:-./base_docs}:/base_docs:ro"]
     ports: ["127.0.0.1:8002:8000"]
-    depends_on: [qdrant, llm-gateway]
+    depends_on:
+      postgres: {condition: service_healthy}
+      volume-perms: {condition: service_completed_successfully}
+      qdrant: {condition: service_started}
+      llm-gateway: {condition: service_started}
 
   pipeline:
     <<: *common
     build: ./services/pipeline
     environment:
+      <<: *db
       GATEWAY_URL: http://llm-gateway:8000
       INGEST_URL: http://ingest:8000
       DATA_DIR: /data
     volumes: [pipeline_data:/data]
     ports: ["8004:8000"]
-    depends_on: [ingest, llm-gateway]
+    depends_on:
+      postgres: {condition: service_healthy}
+      volume-perms: {condition: service_completed_successfully}
+      ingest: {condition: service_started}
+      llm-gateway: {condition: service_started}
 
   admin:
     <<: *common
     build: ./services/admin
     environment:
+      <<: *db
       INGEST_URL: http://ingest:8000
       PIPELINE_URL: http://pipeline:8000
       ADMIN_USER: ${ADMIN_USER:-hr}
@@ -57,9 +98,14 @@ services:
       DATA_DIR: /data
     volumes: ["admin_data:/data"]
     ports: ["8003:8000"]
-    depends_on: [ingest, pipeline]
+    depends_on:
+      postgres: {condition: service_healthy}
+      volume-perms: {condition: service_completed_successfully}
+      ingest: {condition: service_started}
+      pipeline: {condition: service_started}
 
 volumes:
+  postgres_data:
   qdrant_data:
   ingest_data:
   pipeline_data:

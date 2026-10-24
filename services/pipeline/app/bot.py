@@ -1,46 +1,59 @@
 """Единая точка обработки входящих (web и MAX): команды → «Передать HR» → сценарий/опросы → RAG-агент."""
 import re
 
-from . import agent, commands, db, engine, hrflow, intent, sentiment, style
+from . import agent, commands, db, engine, hrflow, intent, locks, sentiment, style
 
-HR_LABELS = {"hr:forward": "Передать HR через Корсика", "hr:send": "Передать HR", "hr:cancel": "Не передавать",
-             "hr:contact": "Связаться с рекрутером"}
+HR_LABELS = {"hr:forward": "Передать HR через Корсика", "hr:cancel": "Не передавать", "hr:contact": "Связаться с рекрутером"}
 STALE = "Этот вопрос уже пройден 🙂"
 
 
 async def handle(user_id: str, channel: str, text: str | None = None, payload: str | None = None,
                  name: str | None = None, background=None) -> dict:
-    """→ {"messages": [{text, buttons, md?}], "reply": первый текст, "sources", "grounded", "escalated"}.
-    background — BackgroundTasks FastAPI (анализ тональности не задерживает ответ); без него — синхронно."""
-    text = (text or "").strip() or None
-    db.upsert_user(user_id, name, channel)
-    emp = db.employee_by_user(user_id)
-    res = {"messages": [], "sources": [], "grounded": True, "escalated": False}
-    analyze_id = None
+    """Точка входа для web и MAX. События одного пользователя идут по очереди (см. locks.py)."""
+    async with locks.user_lock(user_id):
+        return await _handle(user_id, channel, text, payload, name, background)
 
+
+async def _scenario_or_question(user_id, channel, text, payload, emp, res) -> int | None:
+    """Ответ на вопрос сценария/опроса, «кнопка без вопроса» или свободный вопрос агенту. → id сообщения для анализа тональности."""
+    answered = await engine.handle_answer(emp, payload=payload, text=text) if emp and (payload or text) else None
+    msg_id = db.add_message(user_id, channel, "user", text or f"[кнопка] {(answered or {}).get('echo') or payload}")
+    if answered:
+        res["messages"] = answered["msgs"]
+        return msg_id if answered["analyze"] else None
+    if payload:  # кнопка без активного вопроса
+        res["messages"] = [engine.msg(STALE)]
+        return None
+    answer = await _free_question(user_id, channel, text, emp, res)
+    res["messages"] = [answer] if answer else []   # нет ответа в базе — в чат ничего не пишем, вопрос уже у HR
+    return msg_id
+
+
+async def _route(user_id, channel, text, payload, emp, res) -> int | None:
+    """Выбирает обработчик входящего: кнопка HR → команда «/» → текст обращения → сценарий и вопросы. → id сообщения для анализа."""
     if payload and payload.startswith("hr:"):
         db.add_message(user_id, channel, "user", f"[кнопка] {HR_LABELS.get(payload, payload)}")
         res["messages"] = await _hr_payload(user_id, channel, payload, emp)
-    elif text and text.startswith("/"):
+        return None
+    if text and text.startswith("/"):
         db.add_message(user_id, channel, "user", text)
         hrflow.stop_waiting(user_id)
         res["messages"] = await _command(user_id, channel, text, emp)
-    elif text and hrflow.awaiting(user_id):  # следующее сообщение после «Передать HR через Корсика» или /HR — текст обращения
-        analyze_id = db.add_message(user_id, channel, "user", text)
-        res["messages"] = [hrflow.take_text(user_id, text)]
-    else:
-        answered = None
-        if emp and (payload or text):
-            answered = await engine.handle_answer(emp, payload=payload, text=text)
-        msg_id = db.add_message(user_id, channel, "user", text or f"[кнопка] {(answered or {}).get('echo') or payload}")
-        if answered:
-            res["messages"] = answered["msgs"]
-            analyze_id = msg_id if answered["analyze"] else None
-        elif payload:  # кнопка без активного вопроса
-            res["messages"] = [engine.msg(STALE)]
-        else:
-            res["messages"] = [await _free_question(user_id, channel, text, emp, res)]
-            analyze_id = msg_id
+        return None
+    if text and hrflow.awaiting(user_id):  # следующее сообщение после «Передать HR через Корсика» — текст обращения, уходит HR сразу
+        msg_id = db.add_message(user_id, channel, "user", text)
+        res["messages"] = [hrflow.take_text(user_id, channel, text)]
+        return msg_id
+    return await _scenario_or_question(user_id, channel, text, payload, emp, res)
+
+
+async def _handle(user_id: str, channel: str, text: str | None, payload: str | None, name: str | None, background) -> dict:
+    """→ {"messages": [{text, buttons, md?}], "reply": первый текст, "sources", "grounded"}.
+    background — BackgroundTasks FastAPI (анализ тональности не задерживает ответ); без него — синхронно."""
+    text = (text or "").strip() or None
+    db.upsert_user(user_id, name, channel)
+    res = {"messages": [], "sources": [], "grounded": True}
+    analyze_id = await _route(user_id, channel, text, payload, db.employee_by_user(user_id), res)
     for m in res["messages"]:
         db.add_message(user_id, channel, "assistant", m["text"], res["sources"], res["grounded"], buttons=m.get("buttons"), image=m.get("image"))
     if analyze_id and text:
@@ -52,29 +65,24 @@ async def handle(user_id: str, channel: str, text: str | None = None, payload: s
     return res
 
 
-async def _free_question(user_id, channel, text, emp, res) -> dict:
-    """Свободный вопрос → RAG-агент. Передача HR — только по кнопке «Передать HR» (с подтверждением пользователя)."""
+async def _free_question(user_id, channel, text, emp, res) -> dict | None:
+    """Свободный вопрос → RAG-агент. Бесшовная эскалация: если ответа в базе нет — Корсик молчит и сразу передаёт вопрос HR
+    (None — сообщений в чат нет); если вопрос личный или тревожный — отвечает и тоже сразу передаёт HR."""
     out = await agent.answer(user_id, channel, text, emp=emp)
     res.update(sources=out["sources"], grounded=out["grounded"])
-    buttons = None
+    if out["hr_options"]:
+        hrflow.escalate(user_id, channel, "unanswered", f"Вопрос без ответа в базе знаний: {text}")
+        return None
     if out["draft"]:
-        hrflow.propose(user_id, "agent", f"{out['draft']['reason']}. Вопрос сотрудника: {text}")
-        buttons = hrflow.confirm_buttons()
-    elif out["hr_options"]:
-        hrflow.propose(user_id, "unanswered", f"Вопрос без ответа в базе знаний: {text}")
-        buttons = hrflow.unanswered_buttons()
-    elif reason := intent.detect(text):  # вопрос по смыслу похож на эскалацию — предлагаем HR, но не отправляем
-        hrflow.propose(user_id, "intent", f"{reason}. Вопрос сотрудника: {text}")
-        buttons = hrflow.confirm_buttons()
-        return {"text": f"{out['reply']}\n\n{intent.SUGGESTION_VY if emp and emp.get('form') == 'vy' else intent.SUGGESTION}", "buttons": buttons, "md": True}
-    return {"text": out["reply"], "buttons": buttons, "md": True}
+        hrflow.escalate(user_id, channel, "agent", f"{out['draft']['reason']}. Вопрос сотрудника: {text}")
+    elif reason := intent.detect(text):  # вопрос по смыслу похож на эскалацию — передаём HR сразу
+        hrflow.escalate(user_id, channel, "intent", f"{reason}. Вопрос сотрудника: {text}")
+    return {"text": out["reply"], "buttons": None, "md": True}
 
 
 async def _hr_payload(user_id: str, channel: str, payload: str, emp: dict | None) -> list[dict]:
     if payload == "hr:forward":
         return [hrflow.start_forward(user_id)]
-    if payload == "hr:send":
-        return [hrflow.send(user_id, channel)]
     if payload == "hr:cancel":
         return [hrflow.cancel(user_id)]
     if payload == "hr:contact":
@@ -91,7 +99,7 @@ async def _command(user_id: str, channel: str, text: str, emp: dict | None) -> l
     if kind == "start":
         return await _start(user_id, channel, arg.strip(), emp, row["reply"])
     if kind == "hr":
-        return [hrflow.hr_command(user_id, row["reply"])]
+        return [hrflow.hr_command(user_id, channel, row["reply"])]
     if kind == "help":
         return [engine.msg(commands.help_text())]
     if kind == "kb":

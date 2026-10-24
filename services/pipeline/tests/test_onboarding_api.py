@@ -203,14 +203,15 @@ def test_surveys_endpoint_and_food_command_and_unknown_command():
 
 
 @respx.mock
-def test_unanswerable_question_offers_hr_buttons_and_grounded_has_none():
+def test_unanswerable_question_is_silently_escalated_and_grounded_has_no_buttons():
     llm_router(search=True)                                   # искал в базе — ничего не нашёл
     u = anon.post("/api/users", json={"name": "Гость"}).json()["user_id"]
     r = anon.post("/api/chat", json={"user_id": u, "message": "Какой пароль от wifi?"}).json()
-    btns = [b["text"] for row in r["messages"][0]["buttons"] for b in row]
-    assert btns == ["Передать HR", "Связаться с рекрутером"] and not r["grounded"]
-    llm_router()                                              # не по теме (поиска не было) — кнопки HR не нужны
+    assert r["messages"] == [] and not r["grounded"]          # в чат ничего, вопрос сразу у HR
+    assert [e["kind"] for e in client.get("/api/escalations").json()] == ["unanswered"]
+    llm_router()                                              # не по теме (поиска не было) — обычный ответ, HR не беспокоим
     assert anon.post("/api/chat", json={"user_id": u, "message": "Посоветуй сериал"}).json()["messages"][0]["buttons"] is None
+    assert len(client.get("/api/escalations").json()) == 1
     llm_router(kb_text="Ответ")
     respx.post(ING).mock(return_value=httpx.Response(200, json=[{"score": 0.9, "doc_id": "d", "title": "ПВТР", "page": 2, "text": "t"}]))
     r = anon.post("/api/chat", json={"user_id": u, "message": "Когда обед?"}).json()
