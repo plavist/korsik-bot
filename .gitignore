@@ -1,0 +1,41 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+data/
+.pytest_cache/
+.coverage
+
+# локальное окружение этой машины (прокси/host-сеть)
+compose.proxy.yml
+
+# секреты и ключи
+.env
+.env.*
+!.env.example
+*.pem.key
+id_*
+
+# исходные материалы кейса и картинки (в образ не входят: загружаются через админку или API)
+ПОЛИПЛАСТИК/
+Korsiki_kartinki/
+
+# мусор и артефакты
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.coverage
+htmlcov/
+data/
+*.db
+*.log
+.DS_Store
+.idea/
+.vscode/
+.claude/
+
+# базовые документы (регламенты) — на сервере, в репозиторий не кладём
+base_docs/*
+!base_docs/README.md
+backups/
